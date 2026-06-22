@@ -395,6 +395,12 @@ def ray_init_for_tests():
     env_vars["NVTE_FUSED_ATTN"] = "0"
     env_vars["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
     env_vars["_SKYRL_USE_NEW_INFERENCE"] = "1" if _SKYRL_USE_NEW_INFERENCE else "0"
+    # DEBUG (mtp investigation): forward NCCL collective-algorithm pins to the Ray workers so we can
+    # test whether size-dependent NCCL algo/proto selection is the source of the mtp_on-vs-nosd policy
+    # grad-reduction divergence. Revert with the other debug artifacts.
+    for _k in ("NCCL_ALGO", "NCCL_PROTO", "NCCL_NTHREADS"):
+        if os.environ.get(_k):
+            env_vars[_k] = os.environ[_k]
     ray.init(runtime_env={"env_vars": env_vars})
 
 

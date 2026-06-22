@@ -256,6 +256,10 @@ def _apply_mtp_config(cfg: SkyRLTrainConfig):
 
     # Inference side: vLLM MTP speculative decoding with the same draft depth. Don't clobber an
     # explicit user-provided speculative_config.
+    # DEBUG GUARD (revert me): SKYRL_DISABLE_SPEC=1 trains the MTP heads but leaves vLLM rollout
+    # in plain autoregressive decode, to isolate the MTP-training machinery from the spec-decode rollout.
+    if os.environ.get("SKYRL_DISABLE_SPEC") == "1":
+        return
     ie_cfg = cfg.generator.inference_engine
     if ie_cfg.speculative_config is None:
         ie_cfg.speculative_config = {

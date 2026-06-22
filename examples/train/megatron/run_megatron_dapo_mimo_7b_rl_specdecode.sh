@@ -1,45 +1,54 @@
 set -x
 
-# Colocated DAPO training+generation for Qwen3.5-9B (dense) on DAPO with Megatron,
-# WITH Multi-Token Prediction (MTP) speculative decoding for faster rollout.
+# Colocated DAPO training+generation for XiaomiMiMo/MiMo-7B-RL (dense) on DAPO with
+# Megatron, WITH native Multi-Token Prediction (MTP) speculative decoding for faster rollout.
 #
-# This is the spec-decode counterpart of run_megatron_dapo_qwen3.5_9b.sh. Every
-# knob below is IDENTICAL to the no-spec script (same batch sizes, LR, parallelism,
-# sampling) so a reward-curve / throughput comparison is apples-to-apples. The ONLY
-# difference is the `trainer.mtp.*` block at the bottom.
+# This is the MiMo-7B-RL counterpart of run_megatron_dapo_qwen3.5_9b_specdecode.sh. The
+# DAPO knobs (batch sizes, LR, sampling, clipping) are kept identical to the Qwen recipe so the
+# reward-curve / throughput comparison stays apples-to-apples; only the model and the few
+# architecture-specific flags below differ.
+#
+# Why MiMo-7B-RL is a good MTP target:
+#   - MiMo was pretrained WITH MTP. The released checkpoint ships one native MTP module
+#     (`num_nextn_predict_layers: 1`, the DeepSeek-style key), so both the training-side head and
+#     the inference-side drafter come from the same pretrained weights — no cold-start head.
+#   - The backbone is a plain Qwen2-style dense transformer (36 layers, full attention,
+#     `attention_bias: true`), so there are NO GDN / linear-attention layers. Two consequences vs
+#     the Qwen3.5 recipe: (a) megatron sample packing IS supported, so we set
+#     remove_microbatch_padding=true for better throughput; (b) we drop the `gdn_prefill_backend`
+#     vLLM engine kwarg — it does nothing here.
+#   - Embeddings are UNTIED (`tie_word_embeddings: false`). The decoupled draft loss therefore
+#     isolates the output projection by detaching `output_layer.weight` (the untied branch of
+#     mtp_detach_shared_output, on by default), so the draft gradient trains ONLY the MTP-head params.
 #
 # What MTP on does (single high-level `trainer.mtp` knob, see skyrl/train/config/config.py):
-#   - Training side: builds + trains Qwen3.5-9B's native MTP head (the model ships
-#     `mtp_num_hidden_layers: 1`) with a decoupled draft loss (top-k soft-CE distillation against
-#     the policy's own detached next-token distribution). The draft gradient never pulls on
-#     the policy backbone.
-#   - Inference side: enables vLLM MTP speculative decoding
-#     (`speculative_config={"method": "mtp", "num_speculative_tokens": 3}`). With a single trained
-#     head, depth>1 reuses that head autoregressively at draft time. vLLM loads the MTP head from the
-#     same policy checkpoint, and SkyRL's weight sync keeps the draft head in sync with the trained
-#     policy each step.
+#   - Training side: megatron-bridge's MiMo bridge builds MiMo-7B-RL's native MTP head (from
+#     `num_nextn_predict_layers`) and trains it with a decoupled draft loss (top-k soft-CE
+#     distillation against the policy's own detached next-token distribution). The draft gradient
+#     never pulls on the policy backbone.
+#   - Inference side: enables vLLM MTP speculative decoding. The generic `{"method": "mtp"}` config
+#     auto-detects MiMo's `mimo_mtp` drafter from the model config. With a single trained head,
+#     depth>1 reuses that head autoregressively at draft time. SkyRL's weight sync keeps the draft
+#     head in sync with the trained policy each step.
 #   - The per-step draft acceptance rate is logged as `vllm/draft_acceptance_rate`.
 #
 # Runs on 1 node of 8xH100s (80GB each).
 #
-# NOTE: verify the exact HF repo id for the 9B model before running
-#   (e.g. `hf download Qwen/Qwen3.5-9B` / check https://huggingface.co/Qwen).
-#
 # Prepare data onto the fast local disk first:
 #   DATA_DIR=/mnt/local_storage/data/dapo bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # Then launch:
-#   bash examples/train/megatron/run_megatron_dapo_qwen3.5_9b_specdecode.sh
+#   bash examples/train/megatron/run_megatron_dapo_mimo_7b_rl_specdecode.sh
 
-MODEL_NAME="Qwen/Qwen3.5-9B"
+MODEL_NAME="XiaomiMiMo/MiMo-7B-RL"
 # Use the fast, non-persistent local disk for data (not the ~/default quota).
 DATA_DIR="/mnt/local_storage/data/dapo"
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
 NUM_NODES=1
 NUM_GPUS_PER_NODE=8
-# 9B is ~4.5x the 2B: a single full-weight copy is ~18GB in bf16. Use inference
-# TP=2 (4 engines) so each engine's weights are halved (~9GB/GPU) and there is
-# more headroom for KV cache during generation. TP=2 comm stays on NVLink.
+# One vLLM engine per GPU (TP=1). A single MiMo-7B copy is ~14GB in bf16, which fits
+# comfortably per engine alongside KV cache + the small MTP drafter at gpu_memory_utilization=0.5
+# (the policy is offloaded during generation under colocate_all).
 NUM_INFERENCE_ENGINES=8
 INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=1
 LOGGER="wandb"  # change to "console" to print to stdout
@@ -62,6 +71,7 @@ EVAL_TOP_P=0.7
 CLIP_RATIO_C=10.0
 MAX_PROMPT_LENGTH=$((1024 * 2))
 MAX_RESPONSE_LENGTH=$((1024 * 8))
+# MiMo-7B-RL has max_position_embeddings=32768, so 2K prompt + 8K response fits with room to spare.
 
 # repro run parameters
 TRAIN_BATCH_SIZE=32
@@ -71,11 +81,12 @@ EVAL_N_SAMPLES_PER_PROMPT=16
 ENFORCE_EAGER=true # cuda graphs can cause some instability
 LR=1e-6
 
-# megatron config -- Qwen3.5-9B is a dense model, so no expert parallelism.
-# TP=4 (up from 2 on the 2B): 9B params + Adam states + 8K-token activations
-# need more sharding to fit at micro batch 1. TP>1 auto-enables sequence
-# parallelism, sharding activations/vocab-logits across the TP group.
-# TP=4, PP=1, CP=1 => DP=2. TP stays within the single-node NVLink domain.
+# megatron config -- MiMo-7B-RL is a dense model, so no expert parallelism.
+# TP=4: 7B params + Adam states + 8K-token activations fit at micro batch 1 with headroom.
+# TP>1 auto-enables sequence parallelism, sharding activations/vocab-logits across the TP group.
+# TP=4, PP=1, CP=1 => DP=2. TP stays within the single-node NVLink domain. (7B is smaller than the
+# Qwen3.5-9B recipe, so TP=2 => DP=4 likely also fits and gives more throughput -- try it if you
+# have headroom.)
 MEGATRON_TP=4
 MEGATRON_PP=1
 MEGATRON_CP=1
@@ -94,26 +105,28 @@ TIS_TYPE=token
 
 
 # Multi-Token Prediction (MTP) speculative decoding.
-# Qwen3.5-9B ships 1 native MTP head (`mtp_num_hidden_layers: 1`); training always trains the
-# checkpoint's heads. NUM_SPECULATIVE_TOKENS is the vLLM *draft depth* only — values > 1 reuse the
-# single head autoregressively at draft time (more speedup, but per-position acceptance decays with
-# depth since the head never trains on its own outputs). Here k=3.
+# MiMo-7B-RL ships 1 native MTP head (`num_nextn_predict_layers: 1`); training always trains the
+# checkpoint's heads (mtp_num_layers left at its default => inferred from the model's HF config).
+# NUM_SPECULATIVE_TOKENS is the vLLM *draft depth* only — values > 1 reuse the single head
+# autoregressively at draft time (more speedup, but per-position acceptance decays with depth since
+# the head never trains on its own outputs). Here k=3.
 MTP_ENABLED=true
 MTP_NUM_SPECULATIVE_TOKENS=3
 MTP_LOSS_TYPE="soft_ce" # "soft_ce" (distill against policy) | "hard_ce" (ground-truth next tokens)
-MTP_LOSS_WEIGHT=1.0
-# NOTE: trainer.policy.megatron_config.mtp_detach_shared_output now defaults to true: the draft loss
-# trains ONLY the MTP-head params; the tied embedding/lm_head is detached (output projection AND the
-# MTP block's re-embedding), so the draft gradient no longer nudges the policy's own logits. Set it
-# to false for the old NeMo-RL behaviour (shared head also trained by the draft loss).
-# Top-k draft loss: distill only the teacher's top-k tokens instead of the full 248K vocab, keeping
+MTP_LOSS_WEIGHT=0.5
+# NOTE: trainer.policy.megatron_config.mtp_detach_shared_output defaults to true. MiMo has UNTIED
+# embeddings, so this detaches the (separate) output_layer.weight passed into the draft projection,
+# along with the MTP block's re-embedding, so the draft gradient trains ONLY the MTP-head params and
+# never nudges the policy's own logits. Set it to false for the old NeMo-RL behaviour (shared head
+# also trained by the draft loss).
+# Top-k draft loss: distill only the teacher's top-k tokens instead of the full vocab, keeping
 # draft-loss memory at O(seq*k) vs O(seq*vocab). Only applies to mtp_loss_type="soft_ce". Here k=256.
 MTP_LOSS_TOPK=256
 
 
-# Qwen3.5 flags
-REMOVE_MICROBATCH_PADDING=false # sample packing is not yet supported for GDN layers in megatron - see: https://github.com/NVIDIA/Megatron-LM/pull/2644
-ENGINE_INIT_KWARGS='{"gdn_prefill_backend": "triton"}' # see https://github.com/vllm-project/vllm/issues/36921#issuecomment-4109702738
+# MiMo flags -- plain Qwen2-style dense attention (no GDN), so sample packing is supported and no
+# special vLLM prefill backend is needed.
+REMOVE_MICROBATCH_PADDING=true
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
 export _SKYRL_USE_NEW_INFERENCE=0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
@@ -141,7 +154,6 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.distributed_executor_backend="$DISTRIBUTED_EXECUTOR_BACKEND" \
   trainer.placement.policy_num_nodes=$NUM_NODES \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS_PER_NODE \
-  generator.inference_engine.engine_init_kwargs="$ENGINE_INIT_KWARGS" \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE \
   trainer.policy.megatron_config.tensor_model_parallel_size=$MEGATRON_TP \
@@ -167,7 +179,7 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy_mini_batch_size=$MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.micro_train_batch_size_per_gpu=1 \
-  trainer.ckpt_interval=50 \
+  trainer.ckpt_interval=-1 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
   trainer.policy.optimizer_config.lr=$LR \
@@ -189,11 +201,11 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \
   trainer.policy.megatron_config.mtp_loss_topk=$MTP_LOSS_TOPK \
   trainer.logger="$LOGGER" \
-  trainer.project_name="qwen3_5_dapo_2" \
-  trainer.run_name="debug_sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
-  trainer.export_path="/mnt/local_storage/exports/debug_sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.project_name="mimo_7b_rl_dapo" \
+  trainer.run_name="sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.export_path="/mnt/local_storage/exports/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   trainer.hf_save_interval=300 \
   trainer.resume_mode=latest \
   trainer.max_ckpts_to_keep=3 \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/debug_sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.ckpt_path="/mnt/local_storage/ckpts/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   $@

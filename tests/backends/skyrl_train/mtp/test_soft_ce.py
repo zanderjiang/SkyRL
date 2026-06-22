@@ -293,6 +293,88 @@ def test_left_pad_zero_logits_do_not_inflate_loss():
     assert loss.item() < torch.log(torch.tensor(float(V))).item()
 
 
+def test_shift_mask_packed_rolls_within_each_segment():
+    # THD packing: one packed row [1, T] holds two sub-sequences with no alignment padding between
+    # them (cu boundary at 2). A naive global roll would let seg0's last position (idx 1) supervise
+    # a target in seg1; the cu_seqlens-aware roll must zero it per-segment instead.
+    mask = torch.ones(1, 4)
+    cu = torch.tensor([0, 2, 4])
+    # depth 0 (shift 1): each segment's last real position has no in-segment target -> zeroed.
+    assert shift_mask_for_mtp(mask, 0, cu_seqlens=cu).tolist() == [[1.0, 0.0, 1.0, 0.0]]
+    # The CP=1 global roll (no cu_seqlens) wrongly keeps idx 1 (its target leaks into seg1).
+    assert shift_mask_for_mtp(mask, 0).tolist() == [[1.0, 1.0, 1.0, 0.0]]
+
+
+def test_shift_mask_packed_handles_alignment_pad_and_short_segments():
+    # seg0: 3 real + 1 alignment pad (boundary at 4); seg1: 2 real (boundary at 6).
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 1.0, 1.0]])
+    cu = torch.tensor([0, 4, 6])
+    # shift 1: seg0 valid sources t0,t1 (t2's target is the pad slot -> 0); seg1 valid source only t0.
+    assert shift_mask_for_mtp(mask, 0, cu_seqlens=cu).tolist() == [[1.0, 1.0, 0.0, 0.0, 1.0, 0.0]]
+    # shift 2 (hard-CE depth 0): seg0 only t0 keeps a real target; seg1 (len 2 < shift) fully zeroed.
+    assert shift_mask_for_mtp(mask, 1, cu_seqlens=cu).tolist() == [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
+
+def test_shift_mask_packed_equals_per_segment_unpacked():
+    # The packed cu_seqlens roll must equal running the unpacked roll on each segment in isolation,
+    # for several depths and ragged segment lengths (with per-segment alignment padding).
+    seg_real = [5, 1, 4, 2]
+    seg_pad = [0, 1, 0, 2]  # alignment padding appended after each segment's real tokens
+    cu, parts = [0], []
+    for r, p in zip(seg_real, seg_pad):
+        parts.append(torch.cat([torch.ones(1, r), torch.zeros(1, p)], dim=1))
+        cu.append(cu[-1] + r + p)
+    packed = torch.cat(parts, dim=1)
+    cu = torch.tensor(cu)
+
+    for depth in range(3):
+        got = shift_mask_for_mtp(packed, depth, cu_seqlens=cu)
+        expected = torch.cat([shift_mask_for_mtp(parts[i], depth) for i in range(len(parts))], dim=1)
+        assert torch.equal(got, expected), (depth, got.tolist(), expected.tolist())
+
+
+def test_packed_draft_loss_equals_unpacked():
+    # End-to-end: the packed top-k soft-CE (single masked-mean over the whole packed row, with the
+    # cu_seqlens mask + global rolls) must reproduce the per-sequence unpacked losses exactly. The
+    # global teacher roll crosses segment boundaries, but those positions are zeroed by the packed
+    # mask, so the surviving per-token losses match the isolated per-sequence computation.
+    from skyrl.backends.skyrl_train.mtp.soft_ce import draft_soft_ce_topk
+
+    torch.manual_seed(0)
+    V, k = 16, 4
+    lengths = [5, 3, 4]
+    pads = [1, 0, 0]  # alignment padding after each segment
+
+    # Per-sequence (unpacked) losses + their valid-token counts.
+    seg_students, seg_teachers, cu, valid_counts, per_seq_loss = [], [], [0], [], []
+    for L, pad in zip(lengths, pads):
+        st = torch.randn(1, L, V)
+        te = torch.randn(1, L, V)
+        m = torch.ones(1, L)
+        lm = shift_mask_for_mtp(m, 0)
+        per_seq_loss.append(draft_soft_ce_topk(st, te, lm, k=k, roll_shift=1))
+        valid_counts.append(lm.sum())
+        # Append the segment + its alignment padding (zero logits / zero mask) to the packed buffers.
+        seg_students.append(torch.cat([st, torch.zeros(1, pad, V)], dim=1))
+        seg_teachers.append(torch.cat([te, torch.zeros(1, pad, V)], dim=1))
+        cu.append(cu[-1] + L + pad)
+
+    packed_student = torch.cat(seg_students, dim=1)
+    packed_teacher = torch.cat(seg_teachers, dim=1)
+    packed_mask = torch.cat(
+        [torch.cat([torch.ones(1, L), torch.zeros(1, p)], dim=1) for L, p in zip(lengths, pads)], dim=1
+    )
+    cu = torch.tensor(cu)
+
+    layer_mask = shift_mask_for_mtp(packed_mask, 0, cu_seqlens=cu)
+    packed_loss = draft_soft_ce_topk(packed_student, packed_teacher, layer_mask, k=k, roll_shift=1)
+
+    # Packed loss is the masked-mean over ALL valid tokens => valid-count-weighted avg of per-seq means.
+    total_valid = sum(valid_counts)
+    expected = sum(loss * c for loss, c in zip(per_seq_loss, valid_counts)) / total_valid
+    assert torch.allclose(packed_loss, expected, atol=1e-6), (packed_loss.item(), expected.item())
+
+
 def test_unpadded_vocab_shard_width():
     from skyrl.backends.skyrl_train.mtp.soft_ce import unpadded_vocab_shard_width
 
