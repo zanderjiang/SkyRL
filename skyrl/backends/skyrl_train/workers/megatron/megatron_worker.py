@@ -1292,6 +1292,38 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             grad_norm = grad_norm.detach().cpu().item() if hasattr(grad_norm, "item") else grad_norm
         return grad_norm
 
+    def save_checkpoint(self, ckpt_dir: str, tokenizer=None):
+        """Save the policy checkpoint, plus the C-full MTP head's separate optimizer state.
+
+        The isolated draft-head optimizer (``self._mtp_separate``) lives OUTSIDE ``self.optimizer``, so
+        the strategy's checkpoint does not cover it. Persist its (DP-sharded) state per global rank
+        alongside the policy checkpoint so resume restores the head's optimizer momentum / scheduler.
+        """
+        super().save_checkpoint(ckpt_dir, tokenizer=tokenizer)
+        if self._mtp_separate is not None:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(self._mtp_separate.state_dict(), os.path.join(ckpt_dir, f"mtp_optim_rank{self._rank}.pt"))
+
+    def load_checkpoint(self, ckpt_dir: str, load_optimizer_states: bool = True, load_lr_scheduler_states: bool = True):
+        states = super().load_checkpoint(
+            ckpt_dir,
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_lr_scheduler_states,
+        )
+        # Restore the C-full MTP head's separate optimizer state. Guarded on existence so a checkpoint
+        # written without C-full (or a topology change) degrades to "fresh head optimizer" instead of
+        # crashing the resume.
+        if self._mtp_separate is not None and load_optimizer_states:
+            mtp_path = os.path.join(ckpt_dir, f"mtp_optim_rank{self._rank}.pt")
+            if os.path.exists(mtp_path):
+                self._mtp_separate.load_state_dict(torch.load(mtp_path, map_location="cpu"))
+            elif self._rank == 0:
+                logger.warning(
+                    f"MTP C-full: no separate-optimizer checkpoint at {mtp_path}; "
+                    "the draft head's optimizer state was not restored."
+                )
+        return states
+
     def get_lr(self) -> Optional[float]:
         """
         Get current learning rate from optimizer.
