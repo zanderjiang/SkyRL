@@ -35,6 +35,38 @@ TORCHTITAN_LIKE_CONFIG_FORMAT = "megatron_gptmodel"
 
 
 # --------------------------------------------------------------------------------------
+# SkyRL-ZeroKL: register the engine-side bitwise kernels IN THE WORKER PROCESS at import time.
+# With distributed_executor_backend="mp", vLLM spawns a worker subprocess that does NOT inherit
+# the driver-process @register_backend(CUSTOM) / logprob patch applied in vllm_engine.setup_envvars
+# (that runs in the engine ACTOR, not the spawned worker). The worker lazily imports THIS module to
+# build the model (string ModelRegistry registration), so registering here -- BEFORE vLLM resolves
+# the attention backend and before sampling -- guarantees the worker actually uses CUSTOM varlen
+# (num_splits=1 => bitwise decode==prefill at all lengths) and the aten-logprob path. Without it the
+# worker silently falls back to vLLM's default flash backend, whose split-K heuristic makes
+# long-context decode != prefill -> the ~0.27 minibatch_rollout_logprobs_abs_diff outliers on the
+# minority of long sequences (mean tiny, max ~0.27, min 0). Idempotent; no-op off the local-spec path.
+if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
+    try:
+        from skyrl.backends.skyrl_train.zerokl import varlen_backend as _zk_varlen
+        from skyrl.backends.skyrl_train.zerokl.vllm_patches import (
+            patch_vllm_logprobs_batch_invariant as _zk_patch_lp,
+        )
+
+        _zk_custom_ok = _zk_varlen.register_varlen_custom_backend()
+        _zk_patch_lp()
+        try:
+            with open("/mnt/local_storage/zerokl_probe.log", "a") as _zk_pf:
+                _zk_pf.write(f"[ZEROKL-WORKER-INIT] pid={os.getpid()} imported gptmodel_vllm; "
+                             f"CUSTOM varlen available={_zk_custom_ok}; logprob patch applied\n")
+        except Exception:
+            pass
+        logger.info("[zerokl] worker-side init: CUSTOM varlen available=%s, logprob patch applied",
+                    _zk_custom_ok)
+    except Exception as _zk_e:  # pragma: no cover
+        logger.warning("[zerokl] worker-side CUSTOM/logprob registration failed: %s", _zk_e)
+
+
+# --------------------------------------------------------------------------------------
 # core_attention replacement: Megatron interface -> vLLM paged Attention
 # --------------------------------------------------------------------------------------
 class MegatronCoreAttnToVLLM(nn.Module):

@@ -110,9 +110,17 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
 
         if not getattr(PyTorchVarlenAttentionImpl, "_FWD_LOGGED", False):
             PyTorchVarlenAttentionImpl._FWD_LOGGED = True
-            print("[zerokl-varlen] PyTorchVarlenAttentionImpl.forward IS EXECUTING "
-                  "(torch.nn.attention.varlen.varlen_attn_out, num_splits="
-                  f"{1 if _FORCE_NUM_SPLITS_1 else 'auto'})", flush=True)
+            _msg = ("[zerokl-varlen] PyTorchVarlenAttentionImpl.forward IS EXECUTING "
+                    "(torch.nn.attention.varlen.varlen_attn_out, num_splits="
+                    f"{1 if _FORCE_NUM_SPLITS_1 else 'auto'})")
+            print(_msg, flush=True)
+            # mp-worker stdout does NOT surface in the driver log -> also write an observable marker
+            # proving the CUSTOM num_splits=1 engine attention actually executed in the engine worker.
+            try:
+                with open("/mnt/local_storage/zerokl_probe.log", "a") as _pf:
+                    _pf.write(f"[ZEROKL-ENGINE-ATTN] pid={os.getpid()} {_msg}\n")
+            except Exception:
+                pass
 
         # Re-read live per-layer metadata + kv_cache from forward context
         attn_metadata, _, kv_cache, _ = get_attention_context(layer.layer_name)
