@@ -714,6 +714,16 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     if os.environ.get("WANDB_API_KEY"):
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+        # On Anyscale, WANDB_SETUP_API_KEY_HOOK runs inside each actor and OVERWRITES the forwarded
+        # WANDB_API_KEY with a placeholder ("API key must have 40+ characters, has 5"), crashing the
+        # entrypoint actor before training. Since this branch only runs when the user explicitly set
+        # WANDB_API_KEY, they want that key -- neutralize Anyscale's hooks so it isn't clobbered.
+        for _wandb_hook in (
+            "WANDB_SETUP_API_KEY_HOOK",
+            "WANDB_PROCESS_RUN_INFO_HOOK",
+            "WANDB_POPULATE_RUN_LOCATION_HOOK",
+        ):
+            env_vars[_wandb_hook] = ""
 
     if os.environ.get("MLFLOW_TRACKING_URI"):
         logger.info("Exporting mlflow tracking uri to ray runtime env")
@@ -741,7 +751,10 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         # in-process vLLM so the GPTModel string-registration in the engine actor reaches model build
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         for _zk in ("SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS", "SKYRL_ZEROKL_SCORING_FORWARD", "SKYRL_ZEROKL_TRAINER_PATCHES", "SKYRL_ZEROKL_BISECT",
-                    "SKYRL_ZEROKL_NO_CHUNKED_PREFILL", "SKYRL_ZEROKL_MAX_MODEL_LEN", "SKYRL_ZEROKL_FWD_PROBE",
+                    "SKYRL_ZEROKL_NO_CHUNKED_PREFILL", "SKYRL_ZEROKL_MAX_MODEL_LEN", "SKYRL_ZEROKL_FWD_PROBE", "SKYRL_ZEROKL_SEQ_PROBE",
+                    # trainer core_attention kernel selection: match the engine's PAGED varlen_attn_out
+                    # (context-reproducible) instead of non-paged varlen_attn. Must reach ALL actors.
+                    "SKYRL_ZEROKL_VARLEN_OUT", "SKYRL_ZEROKL_VARLEN_PAGED",
                     # nightly no-TE bitwise stack: local Megatron layer spec (trainer + engine) + the
                     # CUSTOM num_splits=1 varlen attention backend selection. Must reach ALL actors.
                     "SKYRL_ZEROKL_LOCAL_SPEC", "VLLM_BATCH_INVARIANT", "VARLEN_FORCE_NUM_SPLITS_1"):

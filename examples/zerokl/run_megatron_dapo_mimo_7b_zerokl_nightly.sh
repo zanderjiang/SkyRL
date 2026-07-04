@@ -50,9 +50,13 @@ TOP_P=1.0
 EVAL_TOP_P=0.7
 CLIP_RATIO_C=10.0
 MAX_PROMPT_LENGTH=$((1024 * 2))
-# First-validation response length. Bump to $((1024 * 8)) for the full baseline-scale job once the
-# loop + bitwise zero-KL are confirmed (and set SKYRL_ZEROKL_MAX_MODEL_LEN accordingly below).
-MAX_RESPONSE_LENGTH=$((1024 * 2))
+# Full baseline-scale response length. 2048 was a first-validation value, but it truncated EVERY AIME
+# rollout (avg_response_length pinned at the cap, avg_raw_reward stuck at the -2 overlong floor,
+# pass@8~0) -> no reward signal -> entropy collapse + chaotic loss. AIME reasoning needs >2K tokens, so
+# use 8K (matches the non-zerokl reference). SKYRL_ZEROKL_MAX_MODEL_LEN below auto-follows (= prompt +
+# response = 10K). NOTE: longer KV raises GPU+host RAM; keep the headnode watchdog running (see memory
+# zerokl-headnode-oom) and drop gpu_memory_utilization / engine count if it approaches the RAM ceiling.
+MAX_RESPONSE_LENGTH=$((1024 * 8))
 TRAIN_BATCH_SIZE=32
 MINI_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=8
@@ -80,6 +84,11 @@ export SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS=1   # engine loads HF->local weights at 
 export VLLM_BATCH_INVARIANT=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VARLEN_FORCE_NUM_SPLITS_1=1
+# Trainer attention = plain non-paged varlen_attn (num_splits=1, window=(-1,0)). The paged/varlen_out
+# experiments were a red herring: the ~0.014 residual was the trainer runtime never activating torch's
+# FA3 flash-attn impl (the engine's varlen_backend does; the trainer builds no vLLM engine so it stayed
+# unset -> a different kernel). swap_trainer_core_attention_varlen now calls activate_flash_attention_impl
+# ("FA3"), so plain varlen_attn is bitwise == engine (verified probe_attn_variants.py: 0/2048). PAGED unset.
 # Force chunked prefill OFF for bitwise (a chunk-split prompt would feed the varlen kernel partial
 # KV). Requires max_num_batched_tokens >= max_model_len; we cap max_model_len = prompt+response.
 export SKYRL_ZEROKL_NO_CHUNKED_PREFILL=1
@@ -91,8 +100,12 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 # Diagnostic: localize the residual -> trainer-machinery (padding/Float16Module/forward_backward_func)
 # via [ZEROKL-EXTRACT] (from_parallel vs plain log_softmax) and [ZEROKL-FWDPROBE] (bare unpadded
 # GPTModel vs fbf result). Both print from the trainer worker (whose stdout IS forwarded).
-export SKYRL_ZEROKL_FWD_PROBE=1
-export SKYRL_ZEROKL_BISECT=1  # dump engine vs trainer weight checksums to compare (sync bitwise?)
+# Diagnostics OFF for the production run (localization complete: the residual is the vLLM-paged vs
+# Megatron-non-paged attention-path bf16 drift, ~0.014 mean, handled by TIS below). Flip any to 1 to
+# re-enable: FWD_PROBE (bare-vs-fbf), BISECT (weight fingerprints), SEQ_PROBE (dump tokens for rescore).
+export SKYRL_ZEROKL_FWD_PROBE=0
+export SKYRL_ZEROKL_BISECT=0
+export SKYRL_ZEROKL_SEQ_PROBE=0
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
 
 uv run --isolated --extra zerokl -m examples.train.algorithms.dapo.main_dapo \

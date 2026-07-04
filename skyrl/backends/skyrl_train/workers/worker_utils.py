@@ -52,16 +52,25 @@ def compute_minibatch_rollout_logprob_diff_metrics(
                   f"top diffs={[round(x,3) for x in _tv.tolist()]} "
                   f"train@={[round(x,3) for x in _al[_ti].tolist()]} "
                   f"rollout@={[round(x,3) for x in _rl[_ti].tolist()]}", flush=True)
-            # mp-worker prints don't surface in the run log -> also dump the outlier tokens to a shared
-            # file so the ground-truth engine-vs-trainer divergence is observable. _ti are positions in
-            # the masked (response-token) sequence; train@ = trainer recompute logprob, rollout@ = engine.
+            # mp-worker prints don't surface in the run log -> dump the outlier tokens to a shared file
+            # so the ground-truth engine-vs-trainer divergence is observable. _al/_rl are the masked
+            # (response-only) 1D logprob arrays for THIS micro-batch (=one sequence at micro_fwd=1).
+            # For each top-outlier at masked position ti, record where it sits in the response (ti, n,
+            # first/last?) AND an explicit off-by-one check: if action[ti] matches rollout[ti-1] or
+            # rollout[ti+1], the two streams are SHIFTED (alignment bug), not numerically divergent.
             try:
-                _flat_idx = _m.nonzero(as_tuple=True)[0][_ti].tolist()
+                _n = _ad.numel()
+                _recs = []
+                for _ti1 in _ti.tolist():
+                    _here = abs(float(_al[_ti1]) - float(_rl[_ti1]))
+                    _prev = abs(float(_al[_ti1]) - float(_rl[_ti1 - 1])) if _ti1 - 1 >= 0 else 9.99
+                    _next = abs(float(_al[_ti1]) - float(_rl[_ti1 + 1])) if _ti1 + 1 < _n else 9.99
+                    _where = "FIRST" if _ti1 == 0 else ("LAST" if _ti1 == _n - 1 else f"mid{_ti1}/{_n}")
+                    _recs.append(f"[t={_ti1}/{_n} {_where} d_here={_here:.3f} d_prev={_prev:.3f} "
+                                 f"d_next={_next:.3f} trn={float(_al[_ti1]):.3f} rol={float(_rl[_ti1]):.3f}]")
                 with open("/mnt/local_storage/zerokl_probe.log", "a") as _pf:
-                    _pf.write(f"DIFF n={_ad.numel()} mean={float(_ad.mean()):.6f} max={float(_ad.max()):.6f} "
-                              f"frac>0.05={_fb:.3f} | top={[round(x,4) for x in _tv.tolist()]} "
-                              f"flat_pos={_flat_idx} train@={[round(x,4) for x in _al[_ti].tolist()]} "
-                              f"rollout@={[round(x,4) for x in _rl[_ti].tolist()]}\n")
+                    _pf.write(f"DIFF n={_n} mean={float(_ad.mean()):.6f} max={float(_ad.max()):.6f} "
+                              f"frac>0.05={_fb:.4f} | " + " ".join(_recs) + "\n")
             except Exception:
                 pass
     return {

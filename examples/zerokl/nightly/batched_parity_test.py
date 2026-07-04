@@ -26,8 +26,12 @@ from skyrl.backends.skyrl_train.zerokl import apply_vllm_zerokl_env  # noqa: E40
 
 apply_vllm_zerokl_env()
 register_gptmodel_to_vllm()
+_GMU = float(os.environ.get("ZK_ENGINE_GPU_MEM_UTIL", "0.55"))
+_MAXSEQ = int(os.environ.get("ZK_MAX_NUM_SEQS", str(max(16, N + 4))))
+_MAXLEN = int(os.environ.get("ZK_MAX_MODEL_LEN", "2048"))
 llm = LLM(model=MODEL, hf_overrides={"architectures": [VLLM_MODEL_NAME]}, attention_backend="CUSTOM",
-          dtype="bfloat16", enforce_eager=True, gpu_memory_utilization=0.55, max_model_len=2048,
+          dtype="bfloat16", enforce_eager=True, gpu_memory_utilization=_GMU, max_model_len=_MAXLEN,
+          max_num_seqs=_MAXSEQ,
           enable_prefix_caching=False, enable_chunked_prefill=False, trust_remote_code=True)
 tok = llm.get_tokenizer()
 

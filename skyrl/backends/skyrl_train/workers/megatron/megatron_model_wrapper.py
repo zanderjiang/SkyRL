@@ -297,9 +297,12 @@ class MegatronModelWrapper:
             # be hit (FWD_PROBE dumps here). The BISECT block at line ~685 is in forward_backward_mini_batch
             # which isn't hit before the metric. Writes the SAME formula as the engine (bf16->fp32->sum)
             # to compare to BISECT-ENGINE 89866863.40, plus per-tensor to /mnt/local_storage/zerokl_trn_w.txt.
-            if os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and not getattr(self, "_zk_wdump_done", False):
+            _zk_r0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            if (os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and _zk_r0
+                    and not getattr(self, "_zk_wdump_done", False)):
                 self._zk_wdump_done = True
                 try:
+                    from skyrl.backends.skyrl_train.zerokl.weight_fingerprint import fingerprint_line
                     _gsum, _seen2 = 0.0, set()
                     with open("/mnt/local_storage/zerokl_trn_w.txt", "w") as _wf2:
                         for _mm in self.actor_module:
@@ -316,8 +319,9 @@ class MegatronModelWrapper:
                                         _t2 = _t2.full_tensor()
                                     except Exception:
                                         pass
-                                _wf2.write(f"{_nm2}\t{float(_t2.float().double().abs().sum()):.8f}\t"
-                                           f"{tuple(_t2.shape)}\t{_t2.dtype}\n")
+                                # Same 3-way element-wise fingerprint as the engine dump (bf16 basis)
+                                # so a name-by-name compare proves engine-at-gen == trainer-at-score.
+                                _wf2.write(fingerprint_line(_nm2, _t2))
                                 _gsum += float(_t2.to(torch.bfloat16).float().double().abs().sum())
                     with open("/mnt/local_storage/zerokl_probe.log", "a") as _pf2:
                         _pf2.write(f"BISECT-TRAINER cksum={_gsum:.6f} n={len(_seen2)}\n")
@@ -473,6 +477,58 @@ class MegatronModelWrapper:
                 )
 
             action_log_probs = token_logprobs[:, -num_actions:]
+
+            # SkyRL-ZeroKL KLTRACE: print max|trainer - rollout| for the FIRST several micro-batches
+            # UNCONDITIONALLY (no >0.05 filter). If micro-batch #0 (before any optimizer step) is ~0 and
+            # later ones grow, the live residual is within-batch optimizer DRIFT, not a forward mismatch
+            # (the layer-wise trace proved the forward is bitwise given identical weights).
+            _zk_r0k = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            if (os.environ.get("SKYRL_ZEROKL_SEQ_PROBE") == "1" and _zk_r0k
+                    and rollout_action_logprobs is not None):
+                _c = getattr(self, "_zk_kltrace_n", 0)
+                if _c < 16:
+                    self._zk_kltrace_n = _c + 1
+                    _dm = (action_log_probs.detach().float() - rollout_action_logprobs.detach().float()).abs()
+                    _msg = (f"[ZK-KLTRACE] mb#{_c} max|trn-rol|={float(_dm.max()):.4f} "
+                            f"mean={float(_dm.mean()):.5f} n={_dm.numel()}")
+                    print(_msg, flush=True)
+                    try:
+                        with open("/mnt/local_storage/zerokl_kltrace.log", "a") as _kf:
+                            _kf.write(_msg + "\n")
+                    except Exception:
+                        pass
+
+            # SkyRL-ZeroKL SEQ PROBE: dump the EXACT tokens the trainer scored + both logprob streams
+            # (trainer action_log_probs vs engine rollout_action_logprobs) for the first real micro-batch,
+            # so the residual can be re-scored offline through the engine on these very tokens. This
+            # separates the three remaining hypotheses: (a) the saved tokens are NOT the engine's
+            # trajectory -> generator assembly/alignment bug; (b) engine-prefill(saved) == trainer but !=
+            # rollout -> rollout logprob source; (c) all equal -> residual is a forward-input (positions/
+            # padding). Gated + rank-0 + once. Skipped for packed path (targets differ).
+            _zk_r0p = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            if (os.environ.get("SKYRL_ZEROKL_SEQ_PROBE") == "1" and _zk_r0p
+                    and packed_seq_params is None and not getattr(self, "_zk_seq_probe_done", False)):
+                try:
+                    _rl = rollout_action_logprobs
+                    _absd = (action_log_probs.detach().float() - _rl.detach().float()).abs() if _rl is not None else None
+                    # only bother if this micro-batch actually carries the residual (an outlier present)
+                    if _absd is not None and float(_absd.max()) > 0.05:
+                        self._zk_seq_probe_done = True
+                        torch.save({
+                            "sequences": sequences.detach().cpu(),                    # [B, L] full padded ctx
+                            "attention_mask": data["attention_mask"].detach().cpu(),  # locate real tokens
+                            "position_ids": data.get("position_ids").detach().cpu()
+                            if data.get("position_ids") is not None else None,
+                            "num_actions": int(num_actions),
+                            "action_log_probs": action_log_probs.detach().cpu(),      # trainer [B, na]
+                            "rollout_action_logprobs": _rl.detach().cpu(),            # engine  [B, na]
+                            "loss_mask": loss_mask.detach().cpu() if loss_mask is not None else None,
+                        }, "/mnt/local_storage/zerokl_seq_probe.pt")
+                        print(f"[ZEROKL-SEQPROBE] saved 1 micro-batch (B={sequences.shape[0]} L={sequences.shape[1]} "
+                              f"na={int(num_actions)} max|trn-rol|={float(_absd.max()):.3f}) -> zerokl_seq_probe.pt",
+                              flush=True)
+                except Exception as _e:
+                    print(f"[ZEROKL-SEQPROBE] failed: {type(_e).__name__}: {_e}", flush=True)
 
             # policy loss should be calculated based on the selected token logprobs
             policy_loss, loss_metrics = current_loss_fn(
@@ -713,7 +769,12 @@ class MegatronModelWrapper:
         # (the ENGINE runtime probe). Three-way compare localizes the multi-process 0.0104:
         #   trainer-fwd == SENDER  but  ENGINE != SENDER   -> sync/cumem delivers wrong weights
         #   trainer-fwd == ENGINE  == SENDER               -> weights fine; diff is token alignment
-        if os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and not getattr(self, "_zk_fwd_cksum_done", False):
+        # rank-0 only: all DP replicas hold identical weights, and 8 workers racing one "w" path
+        # truncated the file to 0 bytes. Write from a single rank so the dump is complete + clean.
+        _zk_is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if (os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and _zk_is_rank0
+                and not getattr(self, "_zk_fwd_cksum_done", False)):
+            from skyrl.backends.skyrl_train.zerokl.weight_fingerprint import fingerprint_line
             _wf = None
             try:
                 _wf = open("/mnt/local_storage/zerokl_trn_w.txt", "w")
@@ -735,12 +796,11 @@ class MegatronModelWrapper:
                                 _t = _t.full_tensor()
                             except Exception:
                                 pass
-                        # per-tensor: fp32 checksum of the ACTUAL param (un-rounded) + its native dtype,
-                        # so a bf16-vs-fp32 forward-precision mismatch vs the engine (bf16) is visible.
+                        # 3-way element-wise fingerprint (== engine dump) so compare_weight_fingerprints
+                        # can prove the sync is byte-identical, not just abs-sum-equal.
                         if _wf is not None:
                             try:
-                                _wf.write(f"{_nm}\t{float(_t.float().double().abs().sum()):.8f}\t"
-                                          f"{tuple(_t.shape)}\t{_t.dtype}\n")
+                                _wf.write(fingerprint_line(_nm, _t))
                             except Exception:
                                 pass
                         _s += float(_t.to(torch.bfloat16).float().double().abs().sum()); _n += 1
@@ -759,6 +819,54 @@ class MegatronModelWrapper:
                 pass
             self._zk_fwd_cksum_done = True
 
+        # SkyRL-ZeroKL LAYERTRACE: dump EVERY submodule output of the ACTUAL fbf/Float16Module training
+        # forward (micro-batch 0, rank-0, once) + that micro-batch's tokens, so the distributed-machinery
+        # divergence can be localized against a clean single-process forward (trace_layerwise.py). The bare
+        # GPTModel submodules ARE the objects Float16Module wraps, so hooks fire during the real forward.
+        _zk_lt_handles = []
+        if (os.environ.get("SKYRL_ZEROKL_SEQ_PROBE") == "1" and _zk_is_rank0
+                and not getattr(self, "_zk_ltrace_done", False)):
+            self._zk_ltrace_done = True
+            self._zk_lt_store = {}
+            _lt = self._zk_lt_store
+            _inner_lt = self.actor_module[0]
+            for _ in range(4):
+                _inner_lt = _inner_lt.module if hasattr(_inner_lt, "module") else _inner_lt
+
+            def _mk_lt(_name):
+                def _h(_m, _i, _o):
+                    _t = _o[0] if isinstance(_o, tuple) else _o
+                    if torch.is_tensor(_t) and _name not in _lt:
+                        _lt[_name] = _t.detach().float().cpu()
+                return _h
+
+            def _mk_lt_in(_name):
+                # capture the INPUTS (post-RoPE q/k/v) to core_attention so we can tell whether the
+                # divergence is the kernel or upstream (RoPE/split). key = _name + "::IN<idx>".
+                def _hpre(_m, _args):
+                    for _j, _a in enumerate(_args):
+                        _k = f"{_name}::IN{_j}"
+                        if torch.is_tensor(_a) and _k not in _lt:
+                            _lt[_k] = _a.detach().float().cpu()
+                return _hpre
+            for _nm, _mod in _inner_lt.named_modules():
+                if _nm:
+                    _zk_lt_handles.append(_mod.register_forward_hook(_mk_lt(_nm)))
+                    if _nm.endswith("core_attention"):
+                        _zk_lt_handles.append(_mod.register_forward_pre_hook(_mk_lt_in(_nm)))
+            try:
+                _mb0 = micro_batches[0]
+                torch.save({"sequences": _mb0["sequences"].detach().cpu(),
+                            "attention_mask": _mb0["attention_mask"].detach().cpu(),
+                            "num_actions": int(_mb0["num_actions"]),
+                            "rollout_action_logprobs": _mb0["rollout_action_logprobs"].detach().cpu()
+                            if _mb0.get("rollout_action_logprobs") is not None else None,
+                            "position_ids": _mb0.get("position_ids").detach().cpu()
+                            if _mb0.get("position_ids") is not None else None},
+                           "/mnt/local_storage/trace_live_tokens.pt")
+            except Exception as _e:
+                print(f"[ZEROKL-LAYERTRACE] token save failed: {_e}", flush=True)
+
         with _zerokl_scoring_ctx():
             metrics_list = forward_backward_func(
                 forward_step_func=forward_step,
@@ -769,6 +877,16 @@ class MegatronModelWrapper:
                 micro_batch_size=micro_batch_size,
                 forward_only=forward_only,
             )
+
+        if _zk_lt_handles:
+            for _h in _zk_lt_handles:
+                _h.remove()
+            try:
+                torch.save(self._zk_lt_store, "/mnt/local_storage/trace_live_trainer.pt")
+                print(f"[ZEROKL-LAYERTRACE] dumped {len(self._zk_lt_store)} live-trainer intermediates "
+                      f"-> trace_live_trainer.pt", flush=True)
+            except Exception as _e:
+                print(f"[ZEROKL-LAYERTRACE] dump failed: {_e}", flush=True)
 
         # broadcast metrics to all pp ranks
         if not mpu.is_pipeline_last_stage(ignore_virtual=True):

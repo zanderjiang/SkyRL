@@ -291,12 +291,15 @@ class GPTModelVLLMWrapper(nn.Module):
         if os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and not getattr(self, "_zk_wdump_done", False):
             self._zk_wdump_done = True
             try:
+                from skyrl.backends.skyrl_train.zerokl.weight_fingerprint import fingerprint_line
                 with open("/mnt/local_storage/zerokl_eng_w.txt", "w") as _wf:
                     for _nm, _p in self.gpt.named_parameters():
                         if _p.device.type == "meta":
                             continue
-                        _wf.write(f"{_nm}\t{float(_p.float().double().abs().sum()):.8f}\t{tuple(_p.shape)}\t{_p.dtype}\n")
-                print("[ZEROKL-WDUMP] engine weights -> zerokl_eng_w.txt", flush=True)
+                        # Element-wise fingerprint (abs-sum + sum-of-squares + ramp-dot): an abs-sum
+                        # match alone can mask per-element sync drift; all three matching is conclusive.
+                        _wf.write(fingerprint_line(_nm, _p))
+                print("[ZEROKL-WDUMP] engine weights (3-fp) -> zerokl_eng_w.txt", flush=True)
             except Exception as _e:
                 print(f"[ZEROKL-WDUMP] engine failed: {_e}", flush=True)
         self._rope.set_positions(positions.reshape(-1))  # absolute positions for RoPE

@@ -80,6 +80,11 @@ class AgentLoopState:
     response_end_idx: Optional[int]
     done: bool
     rollout_expert_indices: Optional[List[List[List[int]]]] = None
+    # Engine logprob of the trailing EOS token that gets stripped during turn assembly. Re-attached
+    # when the final EOS is appended back (skyrl_gym_generator EOS-append path) so the EOS token's
+    # rollout logprob equals the engine's real value instead of a 0.0 placeholder -- the placeholder
+    # was the sole per-sequence rollout-vs-train (zero-KL) outlier on EOS-terminated sequences.
+    eos_logprob: Optional[float] = None
 
 
 @dataclass
@@ -552,11 +557,16 @@ class SkyRLGymGenerator(GeneratorInterface):
                 assert response_ids is not None and loss_mask is not None
                 if stop_reason != "length" and response_ids and response_ids[-1] != self.tokenizer.eos_token_id:
                     response_ids.append(self.tokenizer.eos_token_id)
-                    # TODO(Charlie): this should be 0? Otherwise logprobs will be extremely off. But if it is loss
-                    # masked with 0, why bother adding it?
                     loss_mask.append(1)
                     if rollout_logprobs is not None:
-                        rollout_logprobs.append(0.0)
+                        # Re-attach the engine's REAL logprob for this EOS (saved when it was stripped
+                        # during turn assembly) so rollout==train on the EOS token. The previous 0.0
+                        # placeholder was the per-sequence zero-KL outlier: the trainer scores a real
+                        # logprob for the EOS, so |train - 0.0| spiked to the EOS logprob magnitude
+                        # (~0.2-2.4) on every EOS-terminated sequence. Falls back to 0.0 only for a
+                        # synthetic EOS the engine never generated (no real logprob available).
+                        _eos_lp = agent_loop_state.eos_logprob if agent_loop_state is not None else None
+                        rollout_logprobs.append(_eos_lp if _eos_lp is not None else 0.0)
                     if rollout_expert_indices_out is not None and rollout_expert_indices_out:
                         layer_num = len(rollout_expert_indices_out[0])
                         topk = len(rollout_expert_indices_out[0][0]) if layer_num > 0 else 0
@@ -1149,6 +1159,13 @@ class SkyRLGymGenerator(GeneratorInterface):
         # Remove EOS token from response tokens since we are continuing the current assistant message
         new_resp_tokens = turn_output.output_ids.copy()
         if new_resp_tokens and new_resp_tokens[-1] == self.tokenizer.eos_token_id:
+            # Save the engine's real logprob of the EOS BEFORE dropping it, so the EOS-append path can
+            # re-attach it (instead of a 0.0 placeholder) when this turn's EOS becomes the final one.
+            if (
+                turn_output.output_logprobs is not None
+                and len(turn_output.output_logprobs) == len(new_resp_tokens)
+            ):
+                agent_loop_state.eos_logprob = turn_output.output_logprobs[-1]
             new_resp_tokens = new_resp_tokens[:-1]
 
         turn_ids = new_resp_tokens + obs_ids_to_add
