@@ -329,6 +329,11 @@ class InferenceEngineClient(InferenceEngineInterface):
     async def wake_up(self, *args: Any, **kwargs: Any):
         return await self._run_on_all_engines("wake_up", *args, **kwargs)
 
+    async def zerokl_reapply_cached_weights(self):
+        """SkyRL-ZeroKL: re-apply the last synced weights on all engines after the final wake_up
+        (which clobbers them on the nightly stack)."""
+        return await self._run_on_all_engines("zerokl_reapply_cached_weights")
+
     async def sleep(self, *args: Any, **kwargs: Any):
         return await self._run_on_all_engines("sleep", *args, **kwargs)
 

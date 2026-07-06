@@ -390,11 +390,21 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
             unfinished_request_ids = self._get_unfinished_request_ids(output_processor)
             await asyncio.to_thread(engine.abort_request, unfinished_request_ids)
 
-        # SkyRL-ZeroKL: force level 1 (CPU offload + restore) so the bridge-loaded GPTModel
-        # weights survive sleep/wake (level 2 frees the cumem region -> engine weights zeroed).
+        # SkyRL-ZeroKL: level 1 IS required -- but for the NON-parameter state. Level 2 (discard)
+        # zeroes pool-resident derived tensors that are neither named_parameters nor synced (e.g.
+        # RoPE inv_freq), which broke generation catastrophically (step-2 DIFF ~1.0 nat, 96% of
+        # tokens). Level 1 restores that state correctly; its flaw -- restoring the stale step-0
+        # PARAMS over the fresh sync -- is fixed by zerokl_reapply_cached_weights, which the
+        # dispatch calls after the final wake_up to overwrite the params with the synced bytes.
         import os as _os
         level = 1 if (self._is_lora or _os.environ.get("SKYRL_ZERO_KL") == "1") else kwargs.get("level", 2)
         await asyncio.to_thread(self.llm.sleep, level=level)
+
+    async def zerokl_reapply_cached_weights(self):
+        """SkyRL-ZeroKL: re-apply the last synced weights after the final wake_up (which clobbers
+        them on the nightly stack). See WorkerWrap.zerokl_reapply_cached_weights."""
+        engine = self._get_engine()
+        return await asyncio.to_thread(engine.collective_rpc, "zerokl_reapply_cached_weights")
 
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
         import pickle
@@ -639,11 +649,21 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # TODO(team): remove once vllm fixes this
         # otherwise waking it up will output gibberish: https://github.com/vllm-project/vllm/issues/17103
         await self.reset_prefix_cache()
-        # SkyRL-ZeroKL: force level 1 (CPU offload + restore) so the bridge-loaded GPTModel
-        # weights survive sleep/wake (level 2 frees the cumem region -> engine weights zeroed).
+        # SkyRL-ZeroKL: level 1 IS required -- but for the NON-parameter state. Level 2 (discard)
+        # zeroes pool-resident derived tensors that are neither named_parameters nor synced (e.g.
+        # RoPE inv_freq), which broke generation catastrophically (step-2 DIFF ~1.0 nat, 96% of
+        # tokens). Level 1 restores that state correctly; its flaw -- restoring the stale step-0
+        # PARAMS over the fresh sync -- is fixed by zerokl_reapply_cached_weights, which the
+        # dispatch calls after the final wake_up to overwrite the params with the synced bytes.
         import os as _os
         level = 1 if (self._is_lora or _os.environ.get("SKYRL_ZERO_KL") == "1") else kwargs.get("level", 2)
         await self.llm.sleep(level=level)
+
+    async def zerokl_reapply_cached_weights(self):
+        """SkyRL-ZeroKL: re-apply the last synced weights after the final wake_up (which clobbers
+        them on the nightly stack). See WorkerWrap.zerokl_reapply_cached_weights."""
+        engine = self._get_engine()
+        return await engine.collective_rpc("zerokl_reapply_cached_weights")
 
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
         import pickle

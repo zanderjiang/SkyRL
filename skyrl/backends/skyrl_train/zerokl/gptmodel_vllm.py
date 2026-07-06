@@ -286,6 +286,18 @@ class GPTModelVLLMWrapper(nn.Module):
         # attention is the swapped vLLM paged layer (ignores attention_mask, uses vLLM metadata).
         tokens = input_ids.unsqueeze(0)
         pos = positions.unsqueeze(0)
+        # SkyRL-ZeroKL: checksum the weights the ENGINE forward actually consumes, on the first
+        # forward after each native sync (flag set by WorkerWrap.load_weights). Same bf16 basis as
+        # the RECEIVER post-sync total — unequal means the forward reads different storage than
+        # the module params the sync updated.
+        if getattr(self, "_zk_fwd_ck_pending", False):
+            self._zk_fwd_ck_pending = False
+            try:
+                from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16
+
+                print(f"[ZEROKL-ENGFWD] first forward after sync: gpt abs-sum={param_abs_sum_bf16(self.gpt):.6f}", flush=True)
+            except Exception as _e:
+                print(f"[ZEROKL-ENGFWD] checksum failed: {_e}", flush=True)
         # Per-tensor weight dump (first forward) to compare ENGINE runtime weights (post native-sync)
         # to the TRAINER's forward weights offline -> find which params the sync diverges on.
         if os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and not getattr(self, "_zk_wdump_done", False):

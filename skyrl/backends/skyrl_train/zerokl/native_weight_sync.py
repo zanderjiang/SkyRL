@@ -78,6 +78,30 @@ def extract_native_weights(
         print(f"[ZEROKL-CKSUM] SENDER (trainer) sent {_ck['n']} params, abs-sum checksum={_ck['s']:.6f}", flush=True)
 
 
+@torch.no_grad()
+def param_abs_sum_bf16(modules) -> float:
+    """fp64 abs-sum of params on the bf16 basis — the SAME reduction as the weight-sync SENDER
+    checksum and the trainer POSTSTEP probe, so forward-time weight states are directly
+    comparable across trainer scoring / trainer training / engine forwards. Skips meta params.
+    ``modules`` may be a single module or a list; DDP/Float16Module wrappers are unwrapped."""
+    mods = modules if isinstance(modules, (list, tuple)) else [modules]
+    s = 0.0
+    seen = set()
+    for m in mods:
+        inner = m
+        for _ in range(4):
+            if hasattr(inner, "module"):
+                inner = inner.module
+            else:
+                break
+        for name, p in inner.named_parameters():
+            if name in seen or p.device.type == "meta":
+                continue
+            seen.add(name)
+            s += float(p.detach().to(torch.bfloat16).float().double().abs().sum())
+    return s
+
+
 def load_native_weights(target_module, weights_iter, *, strict: bool = True) -> set[str]:
     """Copy ``(native_name, tensor)`` pairs into ``target_module`` in place.
 

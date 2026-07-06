@@ -170,7 +170,7 @@ uv run --isolated --extra zerokl -m examples.train.algorithms.dapo.main_dapo \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.eval_n_samples_per_prompt=$EVAL_N_SAMPLES_PER_PROMPT \
-  generator.inference_engine.gpu_memory_utilization=0.5 \
+  generator.inference_engine.gpu_memory_utilization=0.42 \
   trainer.logger="$LOGGER" \
   trainer.project_name="mimo_7b_rl_dapo" \
   trainer.run_name="zerokl_nightly_dapo_mimo_7b_rl_dp${NUM_GPUS_PER_NODE}" \

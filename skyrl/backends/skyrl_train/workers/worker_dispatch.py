@@ -8,6 +8,7 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -579,10 +580,21 @@ class WorkerDispatch:
         # — otherwise we'd export some other tenant's LoRA weights to vLLM.
         self.ensure_active_adapter("policy", model_id)
         if self.colocate_all:
+            # SkyRL-ZeroKL: on the nightly vLLM stack, ANY wake_up issued after the weight
+            # broadcast clobbers the freshly synced weights (sleep level 1 -> restores the stale
+            # step-0 CPU backup; level 2 -> zero pages) — the wake path is not reliably scoped to
+            # the requested tags. Proven live via [ZEROKL-ENGFWD] (theta_0 resp. abs-sum=0.0 at
+            # forward time while receiver totals matched the sender at sync time). Moving the
+            # broadcast after wake_up(tags=["kv_cache"]) OOMs (the NCCL transport needs up to a
+            # full-model staging buffer, which no longer fits once the KV pool is allocated), so
+            # keep the memory-safe order and RE-APPLY the synced weights from the engine-side CPU
+            # cache after the final wake — that copy is per-tensor and needs no big staging.
             await self._inference_engine_client.wake_up(tags=["weights"])
             self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
             self._finish_weight_sync()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
+            if os.environ.get("SKYRL_ZERO_KL") == "1":
+                await self._inference_engine_client.zerokl_reapply_cached_weights()
         else:
             strategy = self.cfg.trainer.strategy
             is_lora = self.cfg.trainer.policy.model.lora.rank > 0

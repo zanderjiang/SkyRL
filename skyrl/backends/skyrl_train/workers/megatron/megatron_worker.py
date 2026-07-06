@@ -593,6 +593,14 @@ class MegatronWorker:
         """
         from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
 
+        # SkyRL-ZeroKL: checksum the weights this SCORING forward actually consumes, on the same
+        # bf16 basis as the SENDER/POSTSTEP probes. Compare against the last sync's SENDER value:
+        # unequal => the offload/backload cycle between sync and scoring changed the bytes.
+        if os.environ.get("SKYRL_ZERO_KL") == "1":
+            from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16
+
+            print(f"[ZEROKL-SCOREFWD] scoring-forward param abs-sum={param_abs_sum_bf16(self.actor_module):.6f}", flush=True)
+
         use_token_batching = self.cfg.max_tokens_per_microbatch > 0
 
         if use_token_batching:
@@ -1276,12 +1284,66 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             raise RuntimeError("optim_step called but policy.inference_only_init=True (no optimizer constructed)")
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
+        if os.environ.get("SKYRL_ZERO_KL") == "1":
+            self._zerokl_force_fresh_model_params()
+
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item() if hasattr(grad_norm, "item") else grad_norm
         return grad_norm
+
+    @torch.no_grad()
+    def _zerokl_param_abs_sum(self) -> float:
+        """fp64 abs-sum of the model params on the bf16 basis (same basis as the weight-sync
+        SENDER checksum in extract_native_weights), so the values are directly comparable."""
+        from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16
+
+        return param_abs_sum_bf16(self.actor_module)
+
+    @torch.no_grad()
+    def _zerokl_force_fresh_model_params(self):
+        """SkyRL-ZeroKL: guarantee the model param buffer holds THIS step's updated weights
+        before anything else (weight-sync extraction, model offload) reads it.
+
+        Live DP8 run xl6cg6rr: under the precision-aware CPU-offloaded optimizer with
+        overlap_cpu_optimizer_d2h_h2d=true, the bytes extracted for weight sync lagged the
+        optimizer by ~2 steps (sender abs-sum checksums at syncs #1-#3 all byte-equal to the
+        initial weights; first change only at sync #4; the per-sync delta ramps like the lr
+        warmup shifted by two steps), while the next scoring forward saw fresher values ->
+        rollout-vs-train logprob mismatch ~0.01 from step 3 onward. Transport itself was
+        verified byte-faithful (all 31 receiver post-sync totals == sender checksums).
+
+        Force the main->model param copy and a synchronous param all-gather (both idempotent
+        if optimizer.step already did them) and drain CUDA streams. The pre/post checksums
+        make (residual) staleness observable per step: pre != post pins the staleness to
+        optimizer.step itself; pre == post but SENDER != POSTSTEP at the next sync pins it
+        to the offload/reload cycle between train and sync.
+        """
+        torch.cuda.synchronize()
+        pre = self._zerokl_param_abs_sum()
+        for _opt in iter_opts(self.optimizer):
+            copy_fn = getattr(_opt, "_copy_main_params_to_model_params", None)
+            if copy_fn is not None:
+                try:
+                    copy_fn()
+                except Exception as e:
+                    print(f"[ZEROKL-POSTSTEP] _copy_main_params_to_model_params failed: {e}", flush=True)
+        for chunk in self.actor_module:
+            sync_fn = getattr(chunk, "start_param_sync", None)
+            if sync_fn is not None:
+                try:
+                    sync_fn(force_sync=True)
+                except Exception as e:
+                    print(f"[ZEROKL-POSTSTEP] start_param_sync(force_sync=True) failed: {e}", flush=True)
+        torch.cuda.synchronize()
+        post = self._zerokl_param_abs_sum()
+        print(
+            f"[ZEROKL-POSTSTEP] param abs-sum pre={pre:.6f} post={post:.6f} "
+            f"({'STALE-AT-STEP: optimizer.step left the buffer stale' if abs(pre - post) > 1e-4 else 'buffer already fresh at step end'})",
+            flush=True,
+        )
 
     def get_lr(self) -> Optional[float]:
         """
@@ -1413,16 +1475,40 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
             await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
         else:
+            # SkyRL-ZeroKL: drain ALL CUDA streams before reading params for extraction, so a
+            # pending async param update (CPU-offloaded optimizer H2D copy-back, buffer reload)
+            # can never make the extracted bytes lag the values the next scoring forward sees.
+            # Also park the DDP grad buffer on CPU for the duration of the send: the broadcast now
+            # runs with the engine KV pool already allocated (all wake_up calls precede the sync —
+            # see save_weights_for_sampler), and the idle ~14GB grad buffer is what pushed the
+            # packed-chunk staging allocations over the 80GB budget (2 OOMs at step-1 sync).
+            # Post-optimizer-step grad values are dead; restore symmetrically so the dispatch
+            # offload state machine is unaffected.
+            _zk_grads_parked = False
+            if os.environ.get("SKYRL_ZERO_KL") == "1":
+                torch.cuda.synchronize()
+                from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+                    load_megatron_grads_to_gpu,
+                    offload_megatron_grads_to_cpu,
+                )
+
+                offload_megatron_grads_to_cpu(self.actor_module)
+                torch.cuda.synchronize()
+                _zk_grads_parked = True
             # Extract and send weights using the sender created at init time.
             # Disable expandable_segments around the send: under colocate_all the
             # CUDA-IPC path calls cudaIpcGetMemHandle, which is incompatible with the
             # VMM addresses expandable segments uses.
-            with self._expandable_segments_disabled_for_sync():
-                weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
-                await self._weight_transfer_sender.send_chunks(
-                    self.weight_extractor.extract_weights(generator_dtype),
-                    weight_metadata=weight_metadata,
-                )
+            try:
+                with self._expandable_segments_disabled_for_sync():
+                    weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
+                    await self._weight_transfer_sender.send_chunks(
+                        self.weight_extractor.extract_weights(generator_dtype),
+                        weight_metadata=weight_metadata,
+                    )
+            finally:
+                if _zk_grads_parked:
+                    load_megatron_grads_to_gpu(self.actor_module)
 
         if cache_reset_task is not None:
             await cache_reset_task

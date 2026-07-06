@@ -406,6 +406,15 @@ class MegatronModelWrapper:
         Returns:
             List[dict]: one metrics dict per micro-batch in order.
         """
+        # SkyRL-ZeroKL: checksum the weights this TRAINING forward actually consumes (same bf16
+        # basis as SENDER/POSTSTEP/SCOREFWD). Run xl6cg6rr/rh9aui7f showed the scoring and training
+        # forwards disagree with the rollout by DIFFERENT amounts (0.0094 vs 0.0057 at step 3),
+        # implying they ran on different weight bytes — this print pins each forward's bytes.
+        if os.environ.get("SKYRL_ZERO_KL") == "1" and not forward_only:
+            from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16
+
+            print(f"[ZEROKL-TRAINFWD] training-forward param abs-sum={param_abs_sum_bf16(self.actor_module):.6f}", flush=True)
+
         forward_backward_func = get_forward_backward_func()
 
         # Resolve loss function

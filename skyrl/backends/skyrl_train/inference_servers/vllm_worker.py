@@ -161,6 +161,11 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                         continue
                     tgt_dtype = dest.dtype if dest.dtype.is_floating_point else tensor.dtype
                     src = tensor.to(self.device, tgt_dtype)
+                    # Cache a CPU copy of every received weight so zerokl_reapply_cached_weights
+                    # can restore them after the post-sync wake_up clobbers the live tensors.
+                    if not hasattr(self, "_zk_cached_weights"):
+                        self._zk_cached_weights = {}
+                    self._zk_cached_weights[name] = src.detach().to("cpu")
                     self._zk_recv_ck = getattr(self, "_zk_recv_ck", 0.0) + float(src.float().double().abs().sum())
                     if dest.is_meta or dest.device.type == "meta" or tuple(dest.shape) != tuple(src.shape):
                         # cumem freed the storage -> param is META; replace the object entirely.
@@ -170,6 +175,13 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                         dest.copy_(src)
                     copied += 1
             self._zerokl_copied = getattr(self, "_zerokl_copied", 0) + copied
+            # Arm the engine-forward weight checksum: the wrapper prints [ZEROKL-ENGFWD] with the
+            # abs-sum of the weights its NEXT forward actually reads (vs the RECEIVER total below).
+            if copied:
+                try:
+                    model._zk_fwd_ck_pending = True
+                except Exception:
+                    pass
             if copied:
                 # checksum of the LIVE engine gpt params (after this sync) -- compare to SENDER cksum
                 _eng = 0.0
@@ -209,6 +221,66 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
 
         for weight in weight_list:
             del weight
+
+    def zerokl_reapply_cached_weights(self) -> int:
+        """Re-copy the last synced weights (cached on CPU at sync time) into the live model.
+
+        On the nightly stack ANY wake_up issued AFTER the native sync clobbers the just-synced
+        weights (sleep level 1 -> restores the never-updated step-0 CPU backup; level 2 -> zero
+        pages), because the wake path is not reliably scoped to the requested tags. The dispatch
+        therefore calls this AFTER the final wake_up(tags=["kv_cache"]), so generation always
+        runs on the trainer's bytes regardless of what the wake machinery did to the tensors.
+        """
+        import torch
+
+        cache = getattr(self, "_zk_cached_weights", None)
+        if not cache:
+            print("[ZEROKL-REAPPLY] no cached weights yet (no native sync seen); skipping", flush=True)
+            return 0
+        model = self.model_runner.model
+        target = model.gpt if hasattr(model, "gpt") else model
+
+        def _set_on_module(root, dotted, value, as_param, requires_grad):
+            *path, attr = dotted.split(".")
+            mod = root
+            for p in path:
+                mod = getattr(mod, p)
+            if as_param:
+                mod._parameters[attr] = torch.nn.Parameter(value, requires_grad=requires_grad)
+            else:
+                mod._buffers[attr] = value
+
+        copied = 0
+        with torch.no_grad():
+            params = dict(target.named_parameters())
+            bufs = dict(target.named_buffers())
+            for name, cpu_t in cache.items():
+                dest = params.get(name)
+                is_param = dest is not None or name not in bufs
+                if dest is None:
+                    dest = bufs.get(name)
+                src = cpu_t.to(self.device)
+                if (
+                    dest is None
+                    or dest.is_meta
+                    or dest.device.type == "meta"
+                    or tuple(dest.shape) != tuple(src.shape)
+                ):
+                    _set_on_module(target, name, src, is_param, getattr(dest, "requires_grad", False))
+                else:
+                    dest.copy_(src)
+                copied += 1
+        torch.accelerator.synchronize()
+        _s = 0.0
+        for _n, _p in target.named_parameters():
+            if _p.device.type != "meta":
+                _s += float(_p.float().double().abs().sum())
+        try:
+            model._zk_fwd_ck_pending = True  # arm the [ZEROKL-ENGFWD] forward-time checksum
+        except Exception:
+            pass
+        print(f"[ZEROKL-REAPPLY] reapplied {copied} cached weights; engine-gpt-abs-sum={_s:.6f}", flush=True)
+        return copied
 
     def teardown_weight_receiver(self):
         """Clean up weight receiver resources."""

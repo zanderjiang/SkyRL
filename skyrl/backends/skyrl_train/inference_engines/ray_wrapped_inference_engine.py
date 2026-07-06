@@ -63,6 +63,9 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
     async def sleep(self, *args: Any, **kwargs: Any):
         return await self.inference_engine_actor.sleep.remote(*args, **kwargs)
 
+    async def zerokl_reapply_cached_weights(self):
+        return await self.inference_engine_actor.zerokl_reapply_cached_weights.remote()
+
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
         return await self.inference_engine_actor.init_weight_update_communicator.remote(init_info)
 
