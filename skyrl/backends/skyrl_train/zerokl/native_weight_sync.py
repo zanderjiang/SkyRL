@@ -18,11 +18,25 @@ belongs in the transport layer; the names/layout here are unchanged.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterator, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def zerokl_debug_enabled() -> bool:
+    """True when ``SKYRL_ZEROKL_DEBUG=1`` -- enables the per-sync / per-step diagnostic
+    checksums and probe prints (full-model fp64 abs-sum reductions).
+
+    OFF by default. These probes are pure observability and cost ~4 full-model fp64
+    reductions per weight sync (SENDER, RECEIVER, engine-post-copy, reapply) plus 2 per
+    optim step (POSTSTEP pre/post) plus one per scoring forward (SCOREFWD) -- a large share
+    of the zero-KL weight-sync regression. The zero-KL *behavior* (native sync, force-fresh
+    main->model copy + param sync, sleep level 1, cached-weight reapply) is INDEPENDENT of
+    this flag and always active under ``SKYRL_ZERO_KL=1``; only the diagnostics are gated."""
+    return os.environ.get("SKYRL_ZEROKL_DEBUG") == "1"
 
 
 def _to_full(t: torch.Tensor) -> torch.Tensor:
@@ -47,7 +61,7 @@ def extract_native_weights(
 
     ``actor_module`` may be a single module or a list (Megatron PP/vpp chunks).
     """
-    import os as _os
+    _debug = zerokl_debug_enabled()
     _ck = {"s": 0.0, "n": 0}
     modules = actor_module if isinstance(actor_module, (list, tuple)) else [actor_module]
     seen = set()
@@ -65,7 +79,7 @@ def extract_native_weights(
                 continue
             seen.add(name)
             t = _to_full(p.detach()).to(dtype)
-            if _os.environ.get("SKYRL_ZERO_KL") == "1":
+            if _debug:
                 _ck["s"] += float(t.float().double().abs().sum()); _ck["n"] += 1
             yield name, t
         if include_buffers:
@@ -74,7 +88,7 @@ def extract_native_weights(
                     continue
                 seen.add(name)
                 yield name, _to_full(b.detach()).to(dtype)
-    if _os.environ.get("SKYRL_ZERO_KL") == "1":
+    if _debug:
         print(f"[ZEROKL-CKSUM] SENDER (trainer) sent {_ck['n']} params, abs-sum checksum={_ck['s']:.6f}", flush=True)
 
 

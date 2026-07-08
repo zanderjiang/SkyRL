@@ -597,9 +597,10 @@ class MegatronWorker:
         # bf16 basis as the SENDER/POSTSTEP probes. Compare against the last sync's SENDER value:
         # unequal => the offload/backload cycle between sync and scoring changed the bytes.
         if os.environ.get("SKYRL_ZERO_KL") == "1":
-            from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16
+            from skyrl.backends.skyrl_train.zerokl.native_weight_sync import param_abs_sum_bf16, zerokl_debug_enabled
 
-            print(f"[ZEROKL-SCOREFWD] scoring-forward param abs-sum={param_abs_sum_bf16(self.actor_module):.6f}", flush=True)
+            if zerokl_debug_enabled():
+                print(f"[ZEROKL-SCOREFWD] scoring-forward param abs-sum={param_abs_sum_bf16(self.actor_module):.6f}", flush=True)
 
         use_token_batching = self.cfg.max_tokens_per_microbatch > 0
 
@@ -1321,8 +1322,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         optimizer.step itself; pre == post but SENDER != POSTSTEP at the next sync pins it
         to the offload/reload cycle between train and sync.
         """
-        torch.cuda.synchronize()
-        pre = self._zerokl_param_abs_sum()
+        from skyrl.backends.skyrl_train.zerokl.native_weight_sync import zerokl_debug_enabled
+
+        debug = zerokl_debug_enabled()
+        # pre/post abs-sums are diagnostic (two full-model fp64 reductions + host syncs); the
+        # copy + force_sync below are the ACTUAL fix (guarantee the model buffer is fresh) and
+        # always run.
+        pre = None
+        if debug:
+            torch.cuda.synchronize()
+            pre = self._zerokl_param_abs_sum()
         for _opt in iter_opts(self.optimizer):
             copy_fn = getattr(_opt, "_copy_main_params_to_model_params", None)
             if copy_fn is not None:
@@ -1337,13 +1346,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     sync_fn(force_sync=True)
                 except Exception as e:
                     print(f"[ZEROKL-POSTSTEP] start_param_sync(force_sync=True) failed: {e}", flush=True)
-        torch.cuda.synchronize()
-        post = self._zerokl_param_abs_sum()
-        print(
-            f"[ZEROKL-POSTSTEP] param abs-sum pre={pre:.6f} post={post:.6f} "
-            f"({'STALE-AT-STEP: optimizer.step left the buffer stale' if abs(pre - post) > 1e-4 else 'buffer already fresh at step end'})",
-            flush=True,
-        )
+        if debug:
+            torch.cuda.synchronize()
+            post = self._zerokl_param_abs_sum()
+            print(
+                f"[ZEROKL-POSTSTEP] param abs-sum pre={pre:.6f} post={post:.6f} "
+                f"({'STALE-AT-STEP: optimizer.step left the buffer stale' if abs(pre - post) > 1e-4 else 'buffer already fresh at step end'})",
+                flush=True,
+            )
 
     def get_lr(self) -> Optional[float]:
         """

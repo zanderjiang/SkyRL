@@ -100,13 +100,16 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
         assert isinstance(request, bytes), f"Expected bytes, got {type(request).__name__}"
         request = pickle.loads(request)
 
-        import os as _os_probe
-        print(
-            f"[ZEROKL-PROBE] WorkerWrap.load_weights CALLED; SKYRL_ZERO_KL={_os_probe.environ.get('SKYRL_ZERO_KL')!r} "
-            f"bracketed={getattr(self, '_skyrl_weight_update_active', False)} "
-            f"model_cls={type(getattr(self.model_runner, 'model', None)).__name__}",
-            flush=True,
-        )
+        from skyrl.backends.skyrl_train.zerokl.native_weight_sync import zerokl_debug_enabled
+        _zk_debug = zerokl_debug_enabled()
+        if _zk_debug:
+            import os as _os_probe
+            print(
+                f"[ZEROKL-PROBE] WorkerWrap.load_weights CALLED; SKYRL_ZERO_KL={_os_probe.environ.get('SKYRL_ZERO_KL')!r} "
+                f"bracketed={getattr(self, '_skyrl_weight_update_active', False)} "
+                f"model_cls={type(getattr(self.model_runner, 'model', None)).__name__}",
+                flush=True,
+            )
 
         weight_list = []
         for name, tensor in self._weight_receiver.receive_weights(request):
@@ -157,7 +160,8 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                             miss.append(name)
                         if name not in self._zk_miss_names:
                             self._zk_miss_names.append(name)
-                            self._zk_miss_ck += float(tensor.float().double().abs().sum())
+                            if _zk_debug:
+                                self._zk_miss_ck += float(tensor.float().double().abs().sum())
                         continue
                     tgt_dtype = dest.dtype if dest.dtype.is_floating_point else tensor.dtype
                     src = tensor.to(self.device, tgt_dtype)
@@ -166,7 +170,8 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                     if not hasattr(self, "_zk_cached_weights"):
                         self._zk_cached_weights = {}
                     self._zk_cached_weights[name] = src.detach().to("cpu")
-                    self._zk_recv_ck = getattr(self, "_zk_recv_ck", 0.0) + float(src.float().double().abs().sum())
+                    if _zk_debug:
+                        self._zk_recv_ck = getattr(self, "_zk_recv_ck", 0.0) + float(src.float().double().abs().sum())
                     if dest.is_meta or dest.device.type == "meta" or tuple(dest.shape) != tuple(src.shape):
                         # cumem freed the storage -> param is META; replace the object entirely.
                         _set_on_module(target, name, src, is_param, getattr(dest, "requires_grad", False))
@@ -175,14 +180,19 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                         dest.copy_(src)
                     copied += 1
             self._zerokl_copied = getattr(self, "_zerokl_copied", 0) + copied
-            # Arm the engine-forward weight checksum: the wrapper prints [ZEROKL-ENGFWD] with the
-            # abs-sum of the weights its NEXT forward actually reads (vs the RECEIVER total below).
-            if copied:
+            # A name miss means the sender exported a param the engine gpt has no slot for -> the
+            # sync is silently incomplete. Always surface it (cheap: name list only); it is a real
+            # correctness signal, not a diagnostic.
+            if self._zk_miss_names:
+                print(f"[ZEROKL-MISS] {len(self._zk_miss_names)} sender names NOT in engine gpt; "
+                      f"names={self._zk_miss_names}", flush=True)
+            if _zk_debug and copied:
+                # Arm the engine-forward weight checksum: the wrapper prints [ZEROKL-ENGFWD] with the
+                # abs-sum of the weights its NEXT forward actually reads (vs the RECEIVER total below).
                 try:
                     model._zk_fwd_ck_pending = True
                 except Exception:
                     pass
-            if copied:
                 # checksum of the LIVE engine gpt params (after this sync) -- compare to SENDER cksum
                 _eng = 0.0
                 for _n, _p in target.named_parameters():
@@ -194,12 +204,10 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                 print(f"[ZEROKL-SYNC] copied {copied} (materialized {materialized}, cum {self._zerokl_copied}) "
                       f"miss={miss}; live first_w_norm={_wn:.3f}", flush=True)
                 if self._zk_miss_names:
-                    print(f"[ZEROKL-MISS] {len(self._zk_miss_names)} sender names NOT in engine gpt; "
-                          f"missed-abs-sum={self._zk_miss_ck:.6f} (== sender-receiver gap). "
-                          f"names={self._zk_miss_names}", flush=True)
-                    # also show a few of the engine's ACTUAL param names so the rename is obvious
+                    # show a few of the engine's ACTUAL param names so the rename is obvious
                     _eng_names = [n for n, _ in target.named_parameters()]
-                    print(f"[ZEROKL-MISS] engine gpt has {len(_eng_names)} params; sample={_eng_names[:6]} ... "
+                    print(f"[ZEROKL-MISS] missed-abs-sum={self._zk_miss_ck:.6f} (== sender-receiver gap); "
+                          f"engine gpt has {len(_eng_names)} params; sample={_eng_names[:6]} ... "
                           f"emb/out: {[n for n in _eng_names if 'embed' in n or 'output_layer' in n or 'lm_head' in n][:4]}",
                           flush=True)
             torch.accelerator.synchronize()  # consume IPC tensors before sender drops them
@@ -271,15 +279,17 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                     dest.copy_(src)
                 copied += 1
         torch.accelerator.synchronize()
-        _s = 0.0
-        for _n, _p in target.named_parameters():
-            if _p.device.type != "meta":
-                _s += float(_p.float().double().abs().sum())
-        try:
-            model._zk_fwd_ck_pending = True  # arm the [ZEROKL-ENGFWD] forward-time checksum
-        except Exception:
-            pass
-        print(f"[ZEROKL-REAPPLY] reapplied {copied} cached weights; engine-gpt-abs-sum={_s:.6f}", flush=True)
+        from skyrl.backends.skyrl_train.zerokl.native_weight_sync import zerokl_debug_enabled
+        if zerokl_debug_enabled():
+            _s = 0.0
+            for _n, _p in target.named_parameters():
+                if _p.device.type != "meta":
+                    _s += float(_p.float().double().abs().sum())
+            try:
+                model._zk_fwd_ck_pending = True  # arm the [ZEROKL-ENGFWD] forward-time checksum
+            except Exception:
+                pass
+            print(f"[ZEROKL-REAPPLY] reapplied {copied} cached weights; engine-gpt-abs-sum={_s:.6f}", flush=True)
         return copied
 
     def teardown_weight_receiver(self):

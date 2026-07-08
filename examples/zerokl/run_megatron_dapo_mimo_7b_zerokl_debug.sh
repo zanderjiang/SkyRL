@@ -55,6 +55,10 @@ OPTIMIZER_OFFLOAD_FRACTION=1.0
 REMOVE_MICROBATCH_PADDING=false
 
 export SKYRL_ZERO_KL=1
+# DEBUG: enable the per-sync / per-step diagnostic checksums + probe prints (SENDER/RECEIVER/
+# ENGFWD/SCOREFWD/POSTSTEP abs-sums). OFF by default in production (each is a full-model fp64
+# reduction; ~4/sync + 2/optim-step) -- gated on this flag so the production run skips them.
+export SKYRL_ZEROKL_DEBUG=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 # DEBUG: load real MiMo weights into the engine GPTModel at init (bridge), so generation
 # coherence tests the FORWARD; the [ZEROKL-SYNC] prints separately test the native sync.
