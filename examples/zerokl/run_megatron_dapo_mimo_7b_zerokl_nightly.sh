@@ -61,7 +61,9 @@ TRAIN_BATCH_SIZE=32
 MINI_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=8
 EVAL_N_SAMPLES_PER_PROMPT=16
-ENFORCE_EAGER=true
+# ROLLOUT ACCEL: CUDA graphs ON (was eager). Bitwise-safe under the num_splits=1 CUSTOM varlen
+# backend -- see the SKYRL_ZEROKL_ENABLE_* block below. Also flipped to False by the cudagraph gate.
+ENFORCE_EAGER=false
 LR=1e-6
 
 # ----- parallelism: TP=1 (DP=4) -----
@@ -89,9 +91,17 @@ export VARLEN_FORCE_NUM_SPLITS_1=1
 # FA3 flash-attn impl (the engine's varlen_backend does; the trainer builds no vLLM engine so it stayed
 # unset -> a different kernel). swap_trainer_core_attention_varlen now calls activate_flash_attention_impl
 # ("FA3"), so plain varlen_attn is bitwise == engine (verified probe_attn_variants.py: 0/2048). PAGED unset.
-# Force chunked prefill OFF for bitwise (a chunk-split prompt would feed the varlen kernel partial
-# KV). Requires max_num_batched_tokens >= max_model_len; we cap max_model_len = prompt+response.
-export SKYRL_ZEROKL_NO_CHUNKED_PREFILL=1
+# ROLLOUT ACCEL (validated bitwise A/B 2026-07-08, DP8 MiMo-7B): prefix caching + chunked prefill
+# + CUDA graphs are ALL bitwise-safe under the num_splits=1 CUSTOM varlen backend -> generate
+# 795s->174s (4.6x), full step 912s->293s (3.1x), policy_kl=0.0 (max abs diff ~4.8e-6 == the all-off
+# baseline; same response length + reward). The prior "force these OFF" config predated the
+# num_splits/FA3 fix and cost 4.6x rollout for zero correctness gain. Per-feature env gates
+# (default OFF in code -> other stacks unaffected) opt this validated script in.
+# To revert to the conservative path: drop these three and set SKYRL_ZEROKL_NO_CHUNKED_PREFILL=1
+# (and ENFORCE_EAGER=true above).
+export SKYRL_ZEROKL_ENABLE_PREFIX_CACHE=1
+export SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL=1
+export SKYRL_ZEROKL_ENABLE_CUDAGRAPH=1
 export SKYRL_ZEROKL_MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 # Legacy in-process engine path (the zero-KL GPTModel registration hook lives there).
 export _SKYRL_USE_NEW_INFERENCE=0

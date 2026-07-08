@@ -757,7 +757,12 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
                     "SKYRL_ZEROKL_VARLEN_OUT", "SKYRL_ZEROKL_VARLEN_PAGED",
                     # nightly no-TE bitwise stack: local Megatron layer spec (trainer + engine) + the
                     # CUSTOM num_splits=1 varlen attention backend selection. Must reach ALL actors.
-                    "SKYRL_ZEROKL_LOCAL_SPEC", "VLLM_BATCH_INVARIANT", "VARLEN_FORCE_NUM_SPLITS_1"):
+                    "SKYRL_ZEROKL_LOCAL_SPEC", "VLLM_BATCH_INVARIANT", "VARLEN_FORCE_NUM_SPLITS_1",
+                    # rollout-accel A/B: re-enable prefix caching / chunked prefill / CUDA graphs
+                    # individually (read in setup_envvars_for_vllm, in the engine actor). Plus the
+                    # diagnostic-gating flag. All read inside actors -> must be forwarded here.
+                    "SKYRL_ZEROKL_ENABLE_PREFIX_CACHE", "SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL",
+                    "SKYRL_ZEROKL_ENABLE_CUDAGRAPH", "SKYRL_ZEROKL_DEBUG"):
             if os.environ.get(_zk):
                 env_vars[_zk] = os.environ[_zk]
 

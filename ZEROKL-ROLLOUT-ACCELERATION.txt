@@ -1,0 +1,257 @@
+================================================================================
+ACCELERATING ROLLOUT UNDER A BITWISE ZERO-KL CONSTRAINT
+Research memo — SkyRL-ZeroKL
+================================================================================
+
+Context: MiMo-7B-RL, DAPO, nightly no-TE stack. Live config
+(run_megatron_dapo_mimo_7b_zerokl_nightly.sh): DP8 x TP1, 32 prompts x 8
+samples = 256 sequences => ~32 concurrent sequences per engine, 8K max
+response, enforce_eager=true, in-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0).
+
+Measured regression vs. non-zero-KL reference: rollout 176s -> 526s (~3x,
+~90% of the per-step slowdown). Weight sync 9s -> 61s (~7x). Post-generate
+handoff gap 0.5s -> 8.2s. Zero-KL is NON-NEGOTIABLE; the goal is to recover
+throughput WITHOUT relaxing bitwise rollout==train equality.
+
+
+================================================================================
+1. WHAT THE CONSTRAINT ACTUALLY IS (AND ISN'T)
+================================================================================
+
+The invariant we need is narrow: for every emitted token,
+
+    logprob(token | prefix, theta) computed by the ENGINE
+      must bitwise-equal
+    the TRAINER's scoring forward of the same function.
+
+This constrains the VALUE of a pure function (weights, token prefix) -> logits.
+It does NOT constrain:
+
+  * WHEN or on WHICH GPU a token's logits are computed
+  * WHAT BATCH COMPOSITION surrounds it (that is what batch invariance buys us)
+  * HOW MANY THROWAWAY TOKENS are computed alongside it
+  * whether KV is CACHED, RECOMPUTED, or MIGRATED -- our stack already proves
+    KV is a bitwise-reproducible pure function of the prefix (decode==prefill,
+    validated 256/256)
+  * the kernel SCHEDULE, as long as each output element's reduction order is a
+    fixed function of the logical shape AND the trainer uses the same one.
+
+The current stack conservatively pins EVERYTHING to "trainer prefill
+semantics." The research frontier is exactly the gap between that conservative
+pin and the true invariant. That gap is large.
+
+THE FUNDAMENTAL LINE:
+  * anything that changes the FUNCTION is dead
+  * anything that changes the SCHEDULE is negotiable
+  * anything that changes only PLACEMENT / TIMING is free
+
+
+================================================================================
+2. WHERE THE 526 SECONDS ACTUALLY GOES
+================================================================================
+
+Per engine: 32 sequences, up to 8K sequential decode steps, eager mode,
+Megatron GPTModel in Python (36 layers of unfused ops), in-process engine loop.
+
+At ~526s for ~5K average decode steps => ~60-100ms per decode step for a 7B on
+an H100. THAT IS KERNEL-LAUNCH / PYTHON-BOUND, not FLOP- or bandwidth-bound. A
+batch of 32 rows through a 7B does not occupy an H100 for even 5ms of real
+compute. The regular run hides the same small batch behind CUDA graphs.
+
+=> Dominant cost = (overhead per decode step) x (number of decode steps).
+   BOTH factors are independently attackable without touching numerics.
+
+
+================================================================================
+3. TAXONOMY: STANDARD INFERENCE TECHNIQUES UNDER ZERO-KL
+================================================================================
+
+LEGEND: [OK] already used   [RESEARCH] probably recoverable, needs validation
+        [HARD] recoverable only by moving the reference   [DEAD] fundamental
+
+  [OK]        Continuous batching
+                 batch-invariant kernels make batch composition irrelevant
+
+  [RESEARCH]  CUDA graphs
+                 capture/replay does not change kernel arithmetic (see 4.1)
+  [RESEARCH]  Speculative decoding (strict rejection)
+                 emitted logprobs come from the target verify forward (see 4.2)
+  [RESEARCH]  Prefix caching
+                 the 0.01-drift diagnosis predates num_splits=1/FA3 (see 4.3)
+  [RESEARCH]  Chunked prefill
+                 k-tokens-vs-cached-KV: same regime as decode-vs-cache, already
+                 bitwise
+
+  [HARD]      Split-KV / FlashDecoding
+                 changes reduction order vs single-pass prefill; fix = canonical
+                 split schedule on BOTH sides (see 4.5)
+  [HARD]      Persistent megakernels / fused decode step
+                 admissible iff per-element reduction orders preserved
+  [HARD]      torch.compile / Inductor fusion
+                 fusion changes arithmetic; must share compiled artifacts both
+                 sides
+  [HARD]      TP>1 with fast collectives
+                 only with pinned deterministic collectives MATCHED trainer-side
+
+  [DEAD]      FP8 / INT weight quantization
+                 pi_old becomes a different function than pi_theta at epoch 0 ->
+                 r != 1 by construction
+  [DEAD]      FP8 / quantized KV cache
+                 decode reads quantized KV, trainer prefill computes bf16 KV ->
+                 different logits
+  [DEAD]      Lossy spec-decode acceptance (Medusa typical-acceptance)
+                 changes the emitted-token DISTRIBUTION, not just numerics
+  [DEAD]      Sliding-window / sparse / linear attention at inference only
+                 different function
+  [DEAD]      Early exit / layer skip / cascade-to-small-model
+                 different function
+
+
+================================================================================
+4. RANKED STRATEGIES
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1  CUDA GRAPHS UNDER BATCH INVARIANCE   (largest expected win, ~2-3x)
+--------------------------------------------------------------------------------
+vLLM's init_batch_invariance forces eager as a blanket simplification, and
+vllm_patches.py inherited that assumption. But graph replay launches literally
+the same kernel binaries with the same launch configs on persistent buffers.
+Two real risk surfaces:
+  (a) padded batch buckets -- harmless if kernels are genuinely row-invariant,
+      which is the DEFINITION of batch invariance
+  (b) captured collectives -- we have none at TP=1.
+Nobody has validated this because nobody else needs bitwise; we have the
+apparatus to.
+
+EXPERIMENT: extend skyrl_engine_parity_test.py to run the same token stream
+through eager vs. graph-captured decode and diff bitwise. If it holds, patch
+vLLM to allow graph capture with VLLM_BATCH_INVARIANT=1. This attacks the
+per-step overhead term directly and mostly de-fangs the num_splits=1 and
+small-batch penalties (launch overhead currently dominates them).
+
+RELATED CHEAP CHECK: VLLM_ENABLE_V1_MULTIPROCESSING=0 may be vestigial. It was
+needed when the logprob patch was applied in the engine actor, but since commit
+1e8af27b the patch registers inside the mp worker (gptmodel_vllm.__init__).
+Re-enabling the separate core-engine process removes scheduler/detokenizer GIL
+contention from the decode loop and plausibly part of the 8s handoff gap.
+Numerics-free.
+
+--------------------------------------------------------------------------------
+4.2  SPECULATIVE DECODING -- MiMo-7B SHIPS THE DRAFT HEADS
+     (~1.5-2.5x, multiplies with 4.1)
+--------------------------------------------------------------------------------
+The elegant one. MiMo-7B-RL has MTP layers specifically trained for speculative
+decoding (Xiaomi reports ~90% acceptance). We currently strip them
+(mp.mtp_num_layers = None) to match backbones -- correct -- but nothing stops
+the ENGINE from using them as a DRAFT while the verified backbone stays
+identical.
+
+WHY ZERO-KL ADMISSIBLE: with strict rejection-sampling spec decode, the draft's
+numerics are irrelevant to correctness -- they only set the acceptance rate.
+Emitted tokens are sampled exactly from the target distribution, and the
+recorded logprobs come from the TARGET model's verification forward, which is a
+multi-token varlen forward -- i.e. PREFILL-SHAPED, the exact kernel regime we
+already matched bitwise to the trainer. Spec decode does not just tolerate the
+constraint; it MOVES compute from the regime we had to painfully patch (1-token
+decode) into the regime that is natively matched (multi-token prefill), and it
+directly DIVIDES the number of sequential steps -- the only thing that shortens
+the 823-910s straggler steps.
+
+MUST VERIFY:
+  (i)  k-tokens-attending-to-cached-KV is bitwise == full prefill under the
+       custom varlen backend (same structure as 1-token-vs-cache, validated
+       256/256 -- but run the harness at k=4-8)
+  (ii) vLLM's spec-decode path routes logprobs through our patched
+       compute_token_logprobs
+  (iii) strict rejection sampling only -- NO typical-acceptance relaxations
+
+LOWEST-FRICTION FIRST EXPERIMENT: n-gram / prompt-lookup spec decode -- no draft
+model at all, decent acceptance on math reasoning (repetitive structure), pure
+verification compute.
+
+--------------------------------------------------------------------------------
+4.3  RE-TEST PREFIX CACHING UNDER THE FIXED STACK
+     (moderate; big for eval)
+--------------------------------------------------------------------------------
+The "prefix caching is THE dominant residual cause" diagnosis
+(vllm_patches.py:89-92) was made BEFORE the FA3 / num_splits=1 / custom-backend
+fixes landed. Under the now-proven invariant -- KV for token i is a
+bitwise-reproducible function of tokens <= i regardless of batch context --
+cached prefix KV should be bitwise identical to recomputed KV. The old drift was
+plausibly the cascade/split path, which is now pinned. DAPO re-prefills the
+shared 2K prompt 8x per group (16x in eval, where we are 4.58x slower with
+eval_n_samples=16 and batch 1024). One parity-harness run with caching enabled
+settles it.
+
+--------------------------------------------------------------------------------
+4.4  STRAGGLER ENGINEERING   (kills the 3 outlier steps)
+--------------------------------------------------------------------------------
+The outliers are tail effects: an engine down to its last long sequences decodes
+at batch~1 with eager overhead -- worst-case regime. Zero-KL gives an unusual
+freedom: SEQUENCE MIGRATION BETWEEN DP RANKS IS NUMERICS-FREE, because
+re-prefilling the migrated prefix on the new engine reproduces KV bitwise (again,
+decode==prefill). Options in increasing effort:
+  * length-predictive routing at dispatch
+  * rebalancing stragglers mid-rollout via prefix recompute
+  * spec decode (4.2), which shortens the critical path of the single longest
+    sequence -- the one thing batching can never fix
+
+--------------------------------------------------------------------------------
+4.5  THE GENUINE RESEARCH CONTRIBUTION: CANONICAL-REDUCTION KERNELS
+     ("move the target")
+--------------------------------------------------------------------------------
+Everything above works WITHIN "decode must equal single-pass prefill." The
+deeper move is to REDEFINE the reference computation so both sides compute
+something parallelizable. Concretely: define attention with a fixed segmented
+softmax -- KV chunks of e.g. 1024 tokens, merged by log-sum-exp in a canonical
+binary tree that depends only on (position, KV length) -- and implement that
+same tree in the engine's decode kernel AND the trainer's scoring kernel. You
+recover split-KV parallelism for long contexts, and chunked prefill and cascade
+attention become admissible BY CONSTRUCTION instead of by accident. The same
+umbrella covers "compile both sides with one Inductor config" and shared GEMM
+schedules at TP>1.
+
+This is the publishable core: bitwise rollout-train equality does NOT require
+pinning inference to the slowest schedule; it requires a schedule that is a
+shared, shape-canonical CONTRACT between engine and trainer. We already do this
+piecemeal (vLLM's RMSNorm kernel in the trainer, FA3 both sides, trainer's
+manual log_softmax in the engine); this generalizes it.
+
+--------------------------------------------------------------------------------
+4.6  FREE WINS OUTSIDE ROLLOUT (from the earlier investigation, still valid)
+--------------------------------------------------------------------------------
+  * Skip the trainer's old-logprob scoring forward -- bitwise equality makes
+    rollout logprobs BE the scoring logprobs (keep a 1-in-N audit step)
+  * Gate the four full-model fp64 checksums and the POSTSTEP forced param-sync
+    behind a debug flag (native_weight_sync.py:69; vllm_worker.py:169/190/277;
+    megatron_worker.py:1287 _zerokl_force_fresh_model_params)
+  * Revisit the sync D2H/H2D full-model round-trip (the wake-clobber reapply
+    correctness fix)
+
+
+================================================================================
+5. SUGGESTED ORDER OF ATTACK
+================================================================================
+
+1. PARITY A/Bs FIRST (cheap, we own the harnesses):
+     - CUDA-graph vs eager
+     - k-token-verify vs prefill
+     - prefix-caching on
+   Each is a yes/no gate on a big lever.
+
+2. SHIP whichever of graphs / V1-multiprocessing / prefix-caching pass --
+   config-level, reversible.
+
+3. MTP SPEC DECODE integration into GPTModelVLLMWrapper (or n-gram first as a
+   wedge).
+
+4. CANONICAL-REDUCTION KERNELS as the longer research arc.
+
+ROUGH CEILING: graphs (~2-3x) x spec decode (~2x) are MULTIPLICATIVE on the
+launch-bound decode loop -- getting zero-KL generation from 526s back into the
+175-250s neighborhood is plausible WITHOUT relaxing bitwise equality at all.
+That would itself be a strong headline result: zero-KL RL at (near-)standard
+rollout throughput.
+
+================================================================================

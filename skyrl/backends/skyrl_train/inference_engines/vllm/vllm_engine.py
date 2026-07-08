@@ -106,15 +106,28 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
         # even though VLLM_BATCH_INVARIANT=1 makes the kernels deterministic. (SkyRL config defaults
         # both to True; without this override the rollout_train_logprobs_abs_diff floors at ~0.0104
         # instead of the ~1e-5 cross-runtime floor.) These cannot be set via env -> mutate kwargs.
+        # ROLLOUT-ACCEL A/B (env-gated, default OFF -> unchanged conservative config). The zero-KL
+        # engine defaults force prefix caching, chunked prefill, and CUDA graphs OFF. These three
+        # flags re-enable them INDIVIDUALLY so we can A/B whether the num_splits=1 CUSTOM varlen
+        # backend keeps rollout==train bitwise with each on. The check is policy_kl /
+        # minibatch_rollout_logprobs_abs_diff staying at the ~1e-6 floor. Per-feature so a
+        # cudagraph-capture failure on the custom model can be bisected out without a code change.
+        _accel_prefix = os.environ.get("SKYRL_ZEROKL_ENABLE_PREFIX_CACHE") == "1"
+        _accel_chunked = os.environ.get("SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL") == "1"
+        _accel_graph = os.environ.get("SKYRL_ZEROKL_ENABLE_CUDAGRAPH") == "1"
         for _k, _v in zerokl_engine_arg_overrides().items():
+            if _accel_graph and _k == "enforce_eager":
+                _v = False
+            if _accel_prefix and _k == "enable_prefix_caching":
+                _v = True
             if kwargs.get(_k) != _v:
                 logger.info("[zerokl] forcing engine arg %s=%s (was %s)", _k, _v, kwargs.get(_k))
             kwargs[_k] = _v
-        # EXPERIMENT (env-gated): also force chunked prefill OFF. vLLM rejects this unless
-        # max_num_batched_tokens >= max_model_len, so cap max_model_len when requested and bump
-        # the batched-token budget to match. Tests whether chunked prefill is the residual 0.0103
-        # (the bitwise standalone dapo_zerokl.py runs enable_chunked_prefill=False).
-        if os.environ.get("SKYRL_ZEROKL_NO_CHUNKED_PREFILL") == "1":
+        # Chunked prefill. Default zero-KL forces it OFF (vLLM then requires
+        # max_num_batched_tokens >= max_model_len, so cap max_model_len and bump the budget). The
+        # accel flag re-enables it (chunking lifts that constraint); max_model_len is still capped
+        # to prompt+response for the generation-length bound.
+        if os.environ.get("SKYRL_ZEROKL_NO_CHUNKED_PREFILL") == "1" and not _accel_chunked:
             _mml = int(os.environ.get("SKYRL_ZEROKL_MAX_MODEL_LEN", "0") or 0)
             if _mml:
                 kwargs["max_model_len"] = _mml
@@ -124,6 +137,13 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
             kwargs["enable_chunked_prefill"] = False
             logger.info("[zerokl] forcing enable_chunked_prefill=False max_model_len=%s max_num_batched_tokens=%s",
                         kwargs.get("max_model_len"), kwargs.get("max_num_batched_tokens"))
+        elif _accel_chunked:
+            _mml = int(os.environ.get("SKYRL_ZEROKL_MAX_MODEL_LEN", "0") or 0)
+            if _mml:
+                kwargs["max_model_len"] = _mml
+            kwargs["enable_chunked_prefill"] = True
+            logger.info("[zerokl] ROLLOUT-ACCEL: chunked_prefill=True prefix_cache=%s cudagraph=%s max_model_len=%s",
+                        _accel_prefix, _accel_graph, kwargs.get("max_model_len"))
         # Run Megatron's GPTModel inside vLLM (unified model) so the rollout == trainer. String
         # registration survives mp/async worker subprocesses (each lazily imports the wrapper).
         register_gptmodel_to_vllm()  # cross-process string form
