@@ -114,6 +114,10 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         language_model_only=ie_cfg.language_model_only,
         mm_processor_cache_gb=0,
         kv_cache_metrics=True,
+        # Parity with the legacy engine path (which hardcodes this): models with custom modeling
+        # code (MiMo, Qwen3.5, DeepSeek-V3, ...) require it to load at all. Overridable via
+        # generator.inference_engine.engine_init_kwargs.trust_remote_code below.
+        trust_remote_code=True,
     )
     for key, value in overrides.items():
         setattr(args, key, value)

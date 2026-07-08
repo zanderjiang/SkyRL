@@ -98,7 +98,9 @@ MTP_SEPARATE_OPTIMIZER=false
 # special vLLM prefill backend is needed.
 REMOVE_MICROBATCH_PADDING=true
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
-export _SKYRL_USE_NEW_INFERENCE=0
+# New inference server path: MTP speculative decoding (drafter weight-sync + acceptance metrics via
+# the vLLM Prometheus scraper) is supported here.
+export _SKYRL_USE_NEW_INFERENCE=1
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
