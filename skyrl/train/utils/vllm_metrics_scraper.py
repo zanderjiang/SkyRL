@@ -418,6 +418,11 @@ class VLLMMetricsScraper:
             out[f"{prefix}draft_num_accepted_tokens"] = accepted_d
         if drafted_d is not None and accepted_d is not None and drafted_d > 0:
             out[f"{prefix}draft_acceptance_rate"] = accepted_d / drafted_d
+        if drafts_d is not None and accepted_d is not None and drafts_d > 0:
+            # Mean acceptance length (vLLM's definition): 1 always-emitted target token per draft
+            # round + the accepted draft tokens per round. This is the average number of tokens
+            # produced per target forward pass -- i.e. the spec-decode speedup factor (1.0 == no gain).
+            out[f"{prefix}draft_mean_acceptance_length"] = 1 + accepted_d / drafts_d
         if drafts_d is not None and drafts_d > 0:
             for name in cur:
                 if not name.startswith(f"{_COUNTER_SPEC_ACCEPTED_PER_POS}::"):

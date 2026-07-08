@@ -274,6 +274,8 @@ async def test_scraper_derives_spec_decode_acceptance():
     assert out["vllm/draft_acceptance_rate"] == pytest.approx(0.75)
     assert out["vllm/draft_acceptance_rate_pos_1"] == pytest.approx(0.9)
     assert out["vllm/draft_acceptance_rate_pos_2"] == pytest.approx(0.6)
+    # Mean acceptance length = 1 + accepted/drafts = 1 + 150/100 = 2.5.
+    assert out["vllm/draft_mean_acceptance_length"] == pytest.approx(2.5)
 
 
 @pytest.mark.asyncio
