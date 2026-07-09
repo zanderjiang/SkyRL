@@ -127,6 +127,9 @@ def force_zerokl_moe_config(provider, *, side: str) -> None:
         raise ValueError("[zerokl] moe_input_jitter_eps must be None (it randomizes routing).")
 
     changes: list[str] = []
+    # OLMoE's provider sets persist_layer_norm=True (a fused-kernel choice, not model math); the
+    # local spec's torch norm asserts it off. Dense providers leave it False, so only MoE hits it.
+    _set_if_present(provider, "persist_layer_norm", False, changes)
     # SequentialMLP: each expert is a plain MLP whose F.linear the batch-invariant aten override
     # makes independent of how many tokens routed to it. Grouped GEMM is batch-variant.
     _set_if_present(provider, "moe_grouped_gemm", False, changes)
@@ -318,6 +321,40 @@ def _make_sorted_topk_routing(orig):
     return _sorted_topk_routing
 
 
+_matmul_invariance_lib = None
+
+
+def _install_moe_matmul_invariance() -> None:
+    """Install vLLM's Triton persistent-matmul overrides for mm/addmm/matmul/linear.
+
+    On SM90+ ``enable_batch_invariant_mode`` only pins the cuBLAS workspace config, which disables
+    split-K (run-to-run determinism) but does NOT make GEMMs batch-invariant: cuBLAS still selects
+    a different kernel/tiling for M=1 than for M=512, so a row's result changes with batch size.
+    The dense zero-KL GEMMs are all bf16, where cuBLAS happens to be row-invariant at our shapes
+    (validated bitwise); the MoE router's fp32 gating mm is NOT (measured 4.3e-5 row drift at
+    [T,2048]x[2048,64], gate-1c localization), and expert GEMMs run at per-expert token counts.
+    vLLM's own SM80 branch installs exactly these overrides; we install them for MoE processes on
+    every platform. Dense models never reach this module, so the validated dense path is untouched.
+    """
+    global _matmul_invariance_lib
+    if _matmul_invariance_lib is not None:
+        return
+    from vllm.model_executor.layers import batch_invariant as bi
+    from vllm.platforms import current_platform
+
+    if current_platform.is_device_capability_family(80):
+        return  # vLLM's enable_batch_invariant_mode already overrides matmuls on SM80.
+
+    lib = torch.library.Library("aten", "IMPL")
+    lib.impl("aten::mm", bi.mm_batch_invariant, "CUDA")
+    lib.impl("aten::addmm", bi.addmm_batch_invariant, "CUDA")
+    lib.impl("aten::matmul", bi.matmul_batch_invariant, "CUDA")
+    lib.impl("aten::linear", bi.linear_batch_invariant, "CUDA")
+    _matmul_invariance_lib = lib
+    print("[ZEROKL-MOE] Triton batch-invariant matmul overrides installed (mm/addmm/matmul/linear; "
+          "cuBLAS is not M-invariant for the fp32 router GEMM on SM90)", flush=True)
+
+
 def enable_moe_deterministic_ops() -> bool:
     """Patch the MoE combine and router top-k for bitwise decode==prefill. Idempotent."""
     global _orig_unpermute, _orig_topk_routing, _deterministic_enabled
@@ -328,6 +365,8 @@ def enable_moe_deterministic_ops() -> bool:
         print("[ZEROKL-MOE] SKYRL_ZEROKL_MOE_DETERMINISTIC=0 -> leaving scatter_add_ combine and "
               "grad-dependent top-k in place (baseline A/B; NOT bitwise)", flush=True)
         return False
+
+    _install_moe_matmul_invariance()
 
     from megatron.core.transformer.moe import moe_utils, router, token_dispatcher
 
@@ -349,7 +388,7 @@ def enable_moe_deterministic_ops() -> bool:
 
 def revert_moe_deterministic_ops() -> None:
     """Restore megatron-core's originals (used by the unit test's A/B)."""
-    global _deterministic_enabled, _validated_calls
+    global _deterministic_enabled, _validated_calls, _matmul_invariance_lib
 
     if not _deterministic_enabled:
         return
@@ -359,6 +398,11 @@ def revert_moe_deterministic_ops() -> None:
     token_dispatcher.unpermute = _orig_unpermute
     moe_utils.topk_routing_with_score_function = _orig_topk_routing
     router.topk_routing_with_score_function = _orig_topk_routing
+    if _matmul_invariance_lib is not None:
+        # De-register the aten overrides too, or the unit test's second "unpatched" baseline
+        # would silently run on the Triton matmuls.
+        _matmul_invariance_lib._destroy()
+        _matmul_invariance_lib = None
     _deterministic_enabled = False
     _validated_calls = 0
 

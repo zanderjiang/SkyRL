@@ -70,6 +70,10 @@ def run_one(batch_invariant: bool):
         enable_chunked_prefill=False,
         trust_remote_code=True,
         seed=0,
+        # Text-only measurement: Qwen3_5ForConditionalGeneration registers as multimodal, and
+        # vLLM's startup profiling would otherwise run the vision processor on a dummy image
+        # (which also needs torchvision, absent from the zerokl env).
+        limit_mm_per_prompt={"image": 0, "video": 0},
     )
     tok = llm.get_tokenizer()
 

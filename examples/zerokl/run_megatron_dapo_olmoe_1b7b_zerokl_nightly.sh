@@ -50,15 +50,17 @@ CLIP_RATIO_LOW=0.2
 CLIP_RATIO_HIGH=0.28
 LOSS_REDUCTION="token_mean"
 APPLY_OVERLONG_FILTERING=true
-OVERLONG_BUFFER_LEN=$((1024 * 4))
+OVERLONG_BUFFER_LEN=512  # scaled to the 2K response cap
 OVERLONG_BUFFER_PENALTY_FACTOR=1.0
 USE_KL_LOSS=false
 TEMPERATURE=1.0
 TOP_P=1.0
 EVAL_TOP_P=0.7
 CLIP_RATIO_C=10.0
+# OLMoE-1B-7B is a 4K-context model (max_position_embeddings=4096); the MiMo 2K+8K
+# split exceeds it and RoPE beyond 4096 is garbage. Fit the window instead.
 MAX_PROMPT_LENGTH=$((1024 * 2))
-MAX_RESPONSE_LENGTH=$((1024 * 8))
+MAX_RESPONSE_LENGTH=$((1024 * 2))
 TRAIN_BATCH_SIZE=32
 MINI_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=8
@@ -97,7 +99,10 @@ export VARLEN_FORCE_NUM_SPLITS_1=1
 # SKYRL_ZEROKL_NO_CHUNKED_PREFILL=1 + ENFORCE_EAGER=true to isolate.
 export SKYRL_ZEROKL_ENABLE_PREFIX_CACHE=1
 export SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL=1
-export SKYRL_ZEROKL_ENABLE_CUDAGRAPH=1
+# CUDA graphs stay OFF for MoE bring-up: SequentialMLP's torch.split needs a device->host sync of
+# the per-expert token counts every layer, which vLLM graph capture cannot tolerate (dense had no
+# such sync -- its cudagraph validation does not transfer). A/B to 1 only after 1e passes eager.
+export SKYRL_ZEROKL_ENABLE_CUDAGRAPH=0
 export SKYRL_ZEROKL_MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 export _SKYRL_USE_NEW_INFERENCE=0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800

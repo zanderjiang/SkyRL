@@ -5,6 +5,48 @@ occupied for the whole window; no free device was ever allocated to this task). 
 lists the exact command to run and the log path it should write to. Nothing in this report is
 claimed as validated unless it says "VALIDATED" and names the evidence.
 
+> **Review update (2026-07-09, later the same day).** Gate 1c was run on a partially free GPU and
+> initially **FAILED**: grad-vs-nograd went to exactly 0.0 (both patched bugs confirmed fixed) but
+> decode-vs-prefill stayed at 3.05e-5 / 2.44e-4. Localization (router logits diverge first, 2.4e-7
+> fp32) found a **third batch-variance bug, in vLLM, not megatron**: on SM90
+> `enable_batch_invariant_mode` installs the Triton batch-invariant matmuls only on SM80; on Hopper
+> it merely pins the cuBLAS workspace (split-K off = run-to-run determinism, NOT M-invariance).
+> Measured: fp32 `[512,2048]@[2048,64]` (the real OLMoE router shape) differs 4.3e-5 between M=512
+> and M=1 under cuBLAS; the Triton path is exactly 0.0 for every shape/dtype tested. Dense zero-KL
+> never saw this because its GEMMs are all bf16, where cuBLAS is row-invariant at our shapes.
+> Fix: `_install_moe_matmul_invariance()` in `moe_batch_invariant.py` registers vLLM's own Triton
+> mm/addmm/matmul/linear overrides from `enable_moe_deterministic_ops` (MoE processes only; dense
+> never reaches it; reverted in `revert_moe_deterministic_ops` for the A/B). With it, **gate 1c
+> PASSES: max == 0.0 for every configuration** (`/mnt/local_storage/logs/moe_layer_invariance_v2.log`).
+> Also: the launch script's `SKYRL_ZEROKL_ENABLE_CUDAGRAPH` was flipped to 0 for bring-up —
+> SequentialMLP's per-layer D2H sync (`torch.split` on per-expert counts) is not capturable, so the
+> dense cudagraph validation does not transfer. Gates 1a/1b/1d/1e, dense regression, and Phase 2
+> remain NOT RUN (GPUs still held by a live training job).
+
+> **Gate results (2026-07-09, GPUs freed).**
+> * **1c PASS** — bitwise max==0.0, both router regimes, decode-vs-prefill AND grad-vs-nograd
+>   (`/mnt/local_storage/logs/moe_layer_invariance_v2.log`).
+> * **1b/1d PASS** — OLMoE-1B-7B through the real engine: coherent generation (expert mapping
+>   loads real weights), zero `[ZEROKL-MISS]`, decode-vs-prefill **BITWISE-IDENTICAL (max==0)**
+>   (`/mnt/local_storage/logs/olmoe_engine_parity_v2.log`). Needed one more provider pin:
+>   OLMoE sets `persist_layer_norm=True`, which the no-apex torch norm asserts against —
+>   now pinned False in `force_zerokl_moe_config`.
+> * **Dense regression PASS** — MiMo-7B-RL still bitwise max==0
+>   (`/mnt/local_storage/logs/mimo_dense_regression.log`).
+> * **Phase 2 MEASURED** — Qwen3.5-0.8B GDN decode-vs-prefill (32×2048 tok, temp 1.0):
+>   **mean 1.67e-2, P50 2.0e-3, P99 0.124, max 0.247, exact-zero 2.52%**, FLAT across position
+>   (steady chunked-vs-recurrent kernel mismatch, not accumulating drift)
+>   (`/mnt/local_storage/logs/gdn_divergence_v4.log`). The `VLLM_BATCH_INVARIANT=1` arm is
+>   impossible upstream: vLLM raises `batch_invariant mode is not supported for GDN_ATTN`.
+>   Script fixes: `limit_mm_per_prompt={"image":0,"video":0}` (Qwen3_5ForConditionalGeneration
+>   registers as multimodal and startup profiling needs torchvision otherwise; a torchvision
+>   import stub is also required in the zerokl env — see the session scratchpad `tvstub`).
+> * **1e IN FLIGHT** — third launch attempt is training. Attempt 1: OLMoE *base* has no chat
+>   template (DAPO generator requires one) → switched to OLMoE-1B-7B-**Instruct**. Attempt 2:
+>   OLMoE is a 4K-context model; 2K+8K exceeded `max_position_embeddings` → window fitted to
+>   2K+2K (overlong buffer 512). All ZEROKL markers verified firing in all 16 actors
+>   (`/tmp/skyrl-logs/infra-260709_040933.log`).
+
 Two things *were* verified without a GPU, on CPU, and are reported as such:
 
 * the new fixed-order expert combine reproduces megatron-core's `scatter_add_` combine exactly in
