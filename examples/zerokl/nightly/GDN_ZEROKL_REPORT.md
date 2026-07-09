@@ -26,8 +26,8 @@ production engine (Megatron `GPTModel` running inside vLLM) has no GDN/mamba sta
 | 3.1 | Engine parity on Qwen3.5-0.8B through the GPTModel-in-vLLM wrapper | **PASS** -- coherent AND 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_gate31_hybrid.log` |
 | T | Trainer builds the real Qwen3.5 hybrid, loads it, fwd+bwd | **PASS** -- 18 GDN + 6 attn; predicts `' Rome'`, prompt CE 1.321 | `/mnt/local_storage/logs/gdn_trainer_model.log` |
 | M | MoE branch of the hybrid spec + expert weight mapping | **PASS** -- SequentialMLP names matched; GDN+MoE forward | `/mnt/local_storage/logs/gdn_moe_hybrid_spec.log` |
-| 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** | -- |
-| 3.3 | Live DP8 run on Qwen3.5-0.8B + GSM8K | **RUNNING** -- `run_megatron_qwen3.5_0.8b_gsm8k_zerokl_nightly.sh` | `/mnt/local_storage/logs/zerokl_gsm8k_qwen35_0.8b.log` |
+| 3.3 | Live DP8 GRPO on Qwen3.5-0.8B + GSM8K | **PASS** -- 6/6 steps `policy_kl = 0.0`, abs_diff <= 8.31e-7 | `/mnt/local_storage/logs/zerokl_gsm8k_qwen35_0.8b.log` |
+| 3.2 | Trainer-vs-engine parity harness on Qwen3.5 | **NOT RUN** (subsumed by 3.3, which measures the same residual live) | -- |
 
 > **A near-miss worth recording.** An earlier Gate 3.1 run reported `256/256 bitwise, max 0.0` and
 > the number was worthless: the generation check in the same log read
@@ -322,6 +322,35 @@ RESULT: PASS
 Two assertions here that a bitwise number cannot make: the architecture really is the hybrid (not 24
 dense layers), and the checkpoint really landed in the GDN parameters (`dt_bias` is not the init's
 all-ones, and the model completes `Italy is` with ` Rome`).
+
+---
+
+## Gate 3.3 -- live zero-KL RL on the GDN hybrid
+
+```
+WANDB_API_KEY=<key> bash examples/zerokl/run_megatron_qwen3.5_0.8b_gsm8k_zerokl_nightly.sh \
+  > /mnt/local_storage/logs/zerokl_gsm8k_qwen35_0.8b.log 2>&1
+```
+
+Qwen3.5-0.8B (18 GatedDeltaNet + 6 attention), GSM8K, GRPO, DP8, temperature 1.0.
+
+| step | `policy_kl` | `policy/rollout_train_logprobs_abs_diff_mean` | `minibatch_rollout_logprobs_abs_diff_mean` |
+|---|---|---|---|
+| 1 | 0.0 | 0.0000 | 8.057e-07 |
+| 2 | 0.0 | 0.0000 | 8.284e-07 |
+| 3 | 0.0 | 0.0000 | 8.109e-07 |
+| 4 | 0.0 | 0.0000 | 8.311e-07 |
+| 5 | 0.0 | 0.0000 | 8.057e-07 |
+| 6 | 0.0 | 0.0000 | 8.064e-07 |
+
+Every step is under the 1e-6 gate, including steps 2-6 **after** the first weight update (the
+sleep/wake weight-clobber failure mode would show up there, not at step 1). `reward/avg_raw_reward =
+0.3555` -- the model is really solving about a third of GSM8K, so the parity is not an artifact of
+truncated or degenerate rollouts. Step time ~320 s, dominated by the rollout (see the cost section).
+
+`minibatch_rollout_logprobs_abs_diff_mean ~ 8e-7` rather than exactly 0 is the pre-existing
+cross-runtime floor of the dense/MoE zero-KL path (fp32 logprob reduction over a full vocab), not a
+GDN residual: the GDN layers themselves are bitwise (Gates 2 and 3.1, max |diff| = 0.0).
 
 ---
 
