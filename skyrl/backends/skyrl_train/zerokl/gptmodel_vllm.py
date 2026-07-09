@@ -280,10 +280,40 @@ class GPTModelVLLMWrapper(nn.Module):
                 print("[ZEROKL-WRAP] forced Qwen3.5 TEXT bridge (GPTModel + GDN, not the VL model)",
                       flush=True)
         mp = b.to_megatron_provider(load_weights=load_weights)
-        mp.tensor_model_parallel_size = 1
+        # ---- tensor parallelism -------------------------------------------------------------
+        # Zero-KL needs the engine's GPTModel sharded EXACTLY as the trainer's, so Megatron TP must
+        # equal vLLM TP. Megatron's model-parallel state does not exist in a vLLM worker, so build it
+        # over the process group vLLM already made: for single-node TP the vLLM worker world IS the
+        # TP group, so `initialize_model_parallel(tp)` reproduces it rank for rank.
+        tp = int(vllm_config.parallel_config.tensor_parallel_size)
+        self._tp_size = tp
+        if tp > 1:
+            from megatron.core import parallel_state as mpu
+            from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+            if not torch.distributed.is_initialized():
+                raise RuntimeError("[zerokl] vLLM did not initialize torch.distributed for TP>1")
+            world = torch.distributed.get_world_size()
+            if world != tp:
+                raise NotImplementedError(
+                    f"[zerokl] engine TP={tp} but torch.distributed world={world}; the zero-KL "
+                    "GPTModel path assumes the vLLM worker world is exactly the TP group "
+                    "(single-node TP, no PP/DP inside the engine)."
+                )
+            if not mpu.model_parallel_is_initialized():
+                mpu.initialize_model_parallel(tensor_model_parallel_size=tp)
+                model_parallel_cuda_manual_seed(0)
+            print(f"[ZEROKL-WRAP] Megatron model-parallel initialized over vLLM's TP group "
+                  f"(tp={tp}, rank={torch.distributed.get_rank()})", flush=True)
+
+        mp.tensor_model_parallel_size = tp
         mp.pipeline_model_parallel_size = 1
-        mp.expert_model_parallel_size = 1
-        mp.expert_tensor_parallel_size = 1
+        mp.expert_model_parallel_size = 1        # EP>1 makes the expert combine a nondeterministic collective
+        mp.expert_tensor_parallel_size = tp      # experts sharded over the TP group (ETP == TP at EP=1)
+        mp.sequence_parallel = False
+        # GPTModel's output layer is column-parallel: with parallel_output=True each rank returns its
+        # vocab shard. vLLM's sampler wants the full row. Gather inside Megatron.
+        mp.parallel_output = False
         mp.pipeline_dtype = torch.bfloat16
         mp.apply_rope_fusion = False
         mp.attention_backend = AttnBackend.flash
@@ -342,10 +372,17 @@ class GPTModelVLLMWrapper(nn.Module):
         # swap attention -> vLLM paged
         cfg = self.gpt.config
         head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
+        # Megatron shards attention heads across TP, so core_attention sees per-RANK head counts.
+        # vLLM's Attention layer likewise expects the local head counts.
+        if cfg.num_attention_heads % self._tp_size or cfg.num_query_groups % self._tp_size:
+            raise ValueError(
+                f"[zerokl] heads ({cfg.num_attention_heads}) and query groups "
+                f"({cfg.num_query_groups}) must both divide TP={self._tp_size}"
+            )
         swap_core_attention(
             self.gpt,
-            num_heads=cfg.num_attention_heads,
-            num_kv_heads=cfg.num_query_groups,
+            num_heads=cfg.num_attention_heads // self._tp_size,
+            num_kv_heads=cfg.num_query_groups // self._tp_size,
             head_dim=head_dim,
             scale=head_dim ** -0.5,
         )

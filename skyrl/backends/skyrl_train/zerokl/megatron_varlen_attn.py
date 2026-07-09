@@ -197,12 +197,18 @@ def swap_trainer_core_attention_varlen(gpt_modules):
             continue
         cfg = inner.config
         head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
+        # Megatron shards attention heads across TP, so core_attention receives PER-RANK head counts.
+        # (The engine's swap_core_attention does the same division.) At TP=1 this is a no-op.
+        tp = getattr(cfg, "tensor_model_parallel_size", 1) or 1
+        if cfg.num_attention_heads % tp or cfg.num_query_groups % tp:
+            raise ValueError(f"[zerokl] heads {cfg.num_attention_heads} / groups {cfg.num_query_groups} "
+                             f"must divide TP={tp}")
         for layer in inner.decoder.layers:
             sa = getattr(layer, "self_attention", None)
-            if sa is None:
-                continue
+            if sa is None or not hasattr(sa, "core_attention"):
+                continue  # GatedDeltaNet layers have no core_attention
             sa.core_attention = TorchVarlenCoreAttn(
-                num_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_query_groups,
+                num_heads=cfg.num_attention_heads // tp, num_kv_heads=cfg.num_query_groups // tp,
                 head_dim=head_dim, scale=head_dim ** -0.5)
             n += 1
     import os as _os2

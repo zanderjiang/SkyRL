@@ -468,6 +468,14 @@ class MegatronWorker:
         provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
         provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
         provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
+        # SkyRL-ZeroKL: sequence parallelism shards activations along the sequence axis, so the
+        # trainer's per-token activations no longer match the engine's (which never shards them) --
+        # and megatron's no-TE `WrappedTorchNorm` refuses it outright ("sequence parallel not
+        # supported by torch LayerNorm"). Both ends must run the same layout for bitwise zero-KL.
+        if os.environ.get("SKYRL_ZERO_KL") == "1" and provider.sequence_parallel:
+            provider.sequence_parallel = False
+            print("[ZEROKL-TRAINER] sequence_parallel forced OFF (engine does not shard the "
+                  "sequence axis; the no-TE norm cannot anyway)", flush=True)
         provider.attention_backend = "flash" if flash_attn else "fused"
         provider.variable_seq_lengths = True
         provider.masked_softmax_fusion = True

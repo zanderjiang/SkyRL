@@ -38,10 +38,11 @@ TEST_FILE="$DATA_DIR/validation.parquet"
 
 NUM_NODES=1
 NUM_GPUS_PER_NODE=8
-NUM_INFERENCE_ENGINES=8
-INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=1   # == MEGATRON_TP (matched); the wrapper is TP=1-scoped
-
-MEGATRON_TP=1
+# TP is matched on both ends (zero-KL requirement). ZEROKL_TP lets us exercise TP>1 on the small
+# model before committing 8 GPUs to a 35B run.
+MEGATRON_TP=${ZEROKL_TP:-1}
+INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=$MEGATRON_TP
+NUM_INFERENCE_ENGINES=$((NUM_GPUS_PER_NODE / MEGATRON_TP))
 MEGATRON_PP=1
 MEGATRON_CP=1
 

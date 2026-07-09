@@ -24,6 +24,14 @@ dependencies = [
     "cloudpathlib>=0.23.0",
 ]
 
+# SkyRL-ZeroKL: vLLM calls `load_general_plugins()` in EVERY worker process (v1/worker/worker_base.py),
+# which is the only hook that reaches vLLM's TP>1 worker subprocesses. The zero-KL engine stack --
+# GPTModel registration, the num_splits=1 CUSTOM varlen backend, batch-invariant matmuls, the
+# sampler's aten log_softmax, the GDN pins -- must be installed there, not just in the engine actor.
+# No-op unless SKYRL_ZERO_KL=1.
+[project.entry-points."vllm.general_plugins"]
+skyrl_zerokl = "skyrl.backends.skyrl_train.zerokl.vllm_plugin:register"
+
 [project.optional-dependencies]
 gpu = [
     "jax[cuda12]>=0.7.2; sys_platform == 'linux'",
