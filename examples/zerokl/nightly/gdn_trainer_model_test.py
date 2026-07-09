@@ -158,8 +158,45 @@ def main():
     if ce > 6.0:
         raise SystemExit(f"FAIL: CE {ce:.3f} on natural text -- the weights are not the checkpoint's")
 
+    # ---- 5. packed (thd) forward, and no leakage across sequence boundaries ------------------
+    # Sample packing is the normal SkyRL configuration. Under thd, Megatron hands core_attention a
+    # 3-D q of [T, np, hn]; the attention must use `cu_seqlens` rather than treating the whole packed
+    # row as one sequence, or a token of sequence 2 attends to sequence 1 and the trainer stops
+    # matching the (per-sequence) rollout. The check: sequence 0's logits inside a packed row must be
+    # bitwise equal to running sequence 0 on its own.
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    seqs = [torch.randint(0, hf_config.text_config.vocab_size, (n,), device=dev) for n in SEQLENS]
+    packed_tokens = torch.cat(seqs).unsqueeze(0)
+    Tp = packed_tokens.shape[1]
+    cu = torch.tensor([0, *torch.tensor(SEQLENS).cumsum(0).tolist()], dtype=torch.int32, device=dev)
+    psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                          max_seqlen_q=max(SEQLENS), max_seqlen_kv=max(SEQLENS))
+    packed_pos = torch.cat([torch.arange(n, device=dev) for n in SEQLENS]).unsqueeze(0)
+
+    with torch.no_grad():
+        lp = gpt(input_ids=packed_tokens, position_ids=packed_pos, attention_mask=None,
+                 packed_seq_params=psp)
+        lp = lp.reshape(Tp, -1) if lp.dim() == 3 else lp
+
+        n0 = SEQLENS[0]
+        cu0 = torch.tensor([0, n0], dtype=torch.int32, device=dev)
+        psp0 = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu0, cu_seqlens_kv=cu0,
+                               max_seqlen_q=n0, max_seqlen_kv=n0)
+        l0 = gpt(input_ids=seqs[0].unsqueeze(0), position_ids=torch.arange(n0, device=dev).unsqueeze(0),
+                 attention_mask=None, packed_seq_params=psp0)
+        l0 = l0.reshape(n0, -1) if l0.dim() == 3 else l0
+
+    d = (lp[:n0].float() - l0.float()).abs().max().item()
+    print(f"5. thd packed forward OK ({Tp} tokens / {len(SEQLENS)} seqs); seq-0 logits packed vs alone: "
+          f"max |diff| = {d:.3e}")
+    if d != 0.0:
+        raise SystemExit(f"FAIL: packing changes sequence 0's logits by {d:.3e} -- attention leaks "
+                         "across the packed boundary (cu_seqlens ignored?)")
+
     print("\nRESULT: PASS -- the trainer builds the Qwen3.5 hybrid (18 GDN + 6 attention), loads the "
-          "checkpoint into its GDN layers, and runs fwd+bwd with no TransformerEngine.")
+          "checkpoint into its GDN layers, and runs unpacked AND packed (thd) fwd+bwd with no "
+          "TransformerEngine.")
 
 
 if __name__ == "__main__":

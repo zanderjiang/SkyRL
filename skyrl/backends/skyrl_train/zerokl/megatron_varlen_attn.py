@@ -57,14 +57,41 @@ class TorchVarlenCoreAttn(nn.Module):
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
                 attention_bias=None, packed_seq_params=None):
-        # Megatron sbhd: q [sq, b, np, hn]; the scoring/training micro-forward uses b==1.
-        sq, b = query.shape[0], query.shape[1]
-        assert b == 1, "TorchVarlenCoreAttn supports the b=1 micro-forward (micro_*_batch_size_per_gpu=1)"
+        # Two layouts reach this kernel:
+        #   sbhd  q [sq, b, np, hn] -- the unpacked micro-forward, b == 1.
+        #   thd   q [t,  np, hn]    -- sample packing; Megatron folds the batch dim away and passes
+        #                             the sequence boundaries in `packed_seq_params`.
+        if query.dim() == 4:
+            sq, b = query.shape[0], query.shape[1]
+            assert b == 1, "TorchVarlenCoreAttn supports the b=1 micro-forward (micro_*_batch_size_per_gpu=1)"
+            packed = False
+        elif query.dim() == 3:
+            sq, b = query.shape[0], 1
+            packed = True
+        else:
+            raise ValueError(f"unexpected core_attention query rank {query.dim()}")
         q = query.reshape(sq, self.num_heads, self.head_dim)
         k = key.reshape(sq, self.num_kv_heads, self.head_dim)
         v = value.reshape(sq, self.num_kv_heads, self.head_dim)
-        cu = torch.tensor([0, sq], device=q.device, dtype=torch.int32)
+
+        # WITHOUT the packed boundaries a packed row would attend straight across sequence
+        # boundaries -- causal within the row, but a token of sequence 2 would see sequence 1. The
+        # rollout engine attends per sequence, so that alone would break zero-KL.
+        max_q = max_k = sq
+        if packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd":
+            cu = packed_seq_params.cu_seqlens_q.to(device=q.device, dtype=torch.int32)
+            cu_kv = packed_seq_params.cu_seqlens_kv.to(device=q.device, dtype=torch.int32)
+            if not torch.equal(cu, cu_kv):
+                raise NotImplementedError("[zerokl] cu_seqlens_q != cu_seqlens_kv")
+            max_q = int(packed_seq_params.max_seqlen_q)
+            max_k = int(packed_seq_params.max_seqlen_kv)
+        elif packed:
+            raise ValueError("[zerokl] thd core_attention input without PackedSeqParams(qkv_format='thd')")
+        else:
+            cu = torch.tensor([0, sq], device=q.device, dtype=torch.int32)
         if self._paged:
+            if packed:
+                raise NotImplementedError("[zerokl] the PAGED varlen recipe does not handle thd packing")
             # engine's PAGED recipe: pack K/V into [num_blocks, 256, kv_heads, head_dim] + block_table so
             # FA3 honors num_splits=1 (context-invariant). Non-inplace pad keeps autograd intact.
             _bs = self._page_bs
@@ -87,12 +114,12 @@ class TorchVarlenCoreAttn(nn.Module):
             # engine's exact kernel (varlen_attn_out) -> honors num_splits=1 context-invariantly.
             _o = torch.empty_like(q)
             out = self._varlen_attn_out(
-                _o, q, k, v, cu, cu, sq, sq,
+                _o, q, k, v, cu, cu, max_q, max_k,
                 scale=self.scale, num_splits=1, enable_gqa=self.enable_gqa, window_size=(-1, 0),
             )
         else:
             out = self._varlen_attn(
-                q, k, v, cu, cu, sq, sq,
+                q, k, v, cu, cu, max_q, max_k,
                 scale=self.scale,
                 num_splits=1,             # single KV-reduction split -> bitwise == engine prefill/decode
                 enable_gqa=self.enable_gqa,
@@ -100,7 +127,9 @@ class TorchVarlenCoreAttn(nn.Module):
             )
         if isinstance(out, tuple):
             out = out[0]
-        return out.reshape(sq, b, self.num_heads * self.head_dim)
+        hp = self.num_heads * self.head_dim
+        # thd keeps the folded layout Megatron handed us; sbhd gets its batch dim back.
+        return out.reshape(sq, hp) if packed else out.reshape(sq, b, hp)
 
 
 def enable_trainer_batch_invariant():
