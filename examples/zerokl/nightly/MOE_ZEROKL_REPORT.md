@@ -41,11 +41,18 @@ claimed as validated unless it says "VALIDATED" and names the evidence.
 >   Script fixes: `limit_mm_per_prompt={"image":0,"video":0}` (Qwen3_5ForConditionalGeneration
 >   registers as multimodal and startup profiling needs torchvision otherwise; a torchvision
 >   import stub is also required in the zerokl env — see the session scratchpad `tvstub`).
-> * **1e IN FLIGHT** — third launch attempt is training. Attempt 1: OLMoE *base* has no chat
->   template (DAPO generator requires one) → switched to OLMoE-1B-7B-**Instruct**. Attempt 2:
->   OLMoE is a 4K-context model; 2K+8K exceeded `max_position_embeddings` → window fitted to
->   2K+2K (overlong buffer 512). All ZEROKL markers verified firing in all 16 actors
->   (`/tmp/skyrl-logs/infra-260709_040933.log`).
+> * **1e PASS** — live DP8 DAPO on OLMoE-1B-7B-Instruct, 5/5 steps at
+>   `policy_kl = 0.0` and `rollout_train_logprobs_abs_diff` mean ≈ 2.4e-7, max ≈ 2.0e-6, FLAT
+>   across the lr warmup (0 → 8e-7), i.e. through real weight updates. Same signature as the
+>   validated MiMo-7B dense runs. Log: `/mnt/local_storage/logs/zerokl_nightly_dapo_olmoe.log`,
+>   wandb `olmoe_1b7b_dapo/runs/aa9zha7q`. Run stopped after the gate (GPUs released).
+>   Two launch fixes were needed: OLMoE *base* has no chat template (DAPO generator requires one)
+>   → use OLMoE-1B-7B-**Instruct**; OLMoE is a 4K-context model, so the MiMo 2K+8K window exceeded
+>   `max_position_embeddings` → fitted to 2K+2K (overlong buffer 512).
+>
+> **Workstream A (MoE bitwise zero-KL at TP=PP=EP=1) is COMPLETE and validated end-to-end.**
+> Remaining MoE follow-ups, none blocking: batch-invariant grouped GEMM (SequentialMLP is slow at
+> high expert counts), CUDA-graph capture for the MoE path, EP>1 (Workstream C).
 
 Two things *were* verified without a GPU, on CPU, and are reported as such:
 
