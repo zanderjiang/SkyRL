@@ -174,7 +174,12 @@ class GPTModelVLLMWrapper(nn.Module):
         super().__init__()
         from megatron.bridge import AutoBridge
         from megatron.core.transformer.enums import AttnBackend
-        from skyrl.backends.skyrl_train.zerokl import apply_megatron_zerokl_patches
+        from skyrl.backends.skyrl_train.zerokl import (
+            apply_megatron_zerokl_patches,
+            make_zerokl_local_layer_spec,
+            patch_olmoe_bridge_for_sequential_mlp,
+            prepare_zerokl_moe,
+        )
 
         # vLLM string-registration instantiates us with only (vllm_config, prefix); derive the
         # model path from the engine config in that case.
@@ -184,6 +189,10 @@ class GPTModelVLLMWrapper(nn.Module):
         # overwrites them via native sync, but loading at init is harmless (env override available).
         if load_weights is None:
             load_weights = os.environ.get("SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS", "1") == "1"
+        # Same pre-bridge mapping retarget the trainer does (megatron_worker.init_configs): under the
+        # SequentialMLP pin, OLMoE's grouped-GEMM-only expert mappings would match nothing.
+        if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
+            patch_olmoe_bridge_for_sequential_mlp()
         b = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
         mp = b.to_megatron_provider(load_weights=load_weights)
         mp.tensor_model_parallel_size = 1
@@ -200,9 +209,9 @@ class GPTModelVLLMWrapper(nn.Module):
         # batch-invariant local-spec forward -- NOT from the TE-targeted megatron patches below.
         self._local_spec = os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1"
         if self._local_spec:
-            from megatron.bridge.models.gpt_provider import local_layer_spec
-
-            mp.transformer_layer_spec = local_layer_spec
+            # MoE providers resolve to get_gpt_layer_local_spec(num_experts=..., grouped_gemm=False)
+            # -> MoELayer(TopKRouter, SequentialMLP); dense providers to bridge's local_layer_spec.
+            mp.transformer_layer_spec = make_zerokl_local_layer_spec(mp)
             print("[ZEROKL-WRAP] forced Megatron LOCAL layer spec (no TransformerEngine)", flush=True)
         # Disable MTP (multi-token prediction) to MATCH the trainer, which drops it for training
         # (megatron_worker.init_configs: mtp_num_layers -> None). MiMo-7B ships MTP layers; if the
@@ -225,6 +234,11 @@ class GPTModelVLLMWrapper(nn.Module):
             mp.rotary_base = _hf.rope_theta
         print(f"[ZEROKL-WRAP] rotary_base set to {getattr(mp, 'rotary_base', '?')} (hf rope_theta="
               f"{getattr(_hf, 'rope_theta', None)}, rope_parameters={_rp})", flush=True)
+        # MoE: pin the identical recipe the trainer pins (SequentialMLP + allgather + fp32 router +
+        # no fusions) and install the deterministic combine / sorted router top-k. Both sides must
+        # apply this or the two GPTModels are different models. No-op on dense providers.
+        if self._local_spec:
+            prepare_zerokl_moe(mp, side="ENGINE")
         mp.finalize()
         gpt = mp.provide_distributed_model(wrap_with_ddp=False)
         self._gpt_list = gpt

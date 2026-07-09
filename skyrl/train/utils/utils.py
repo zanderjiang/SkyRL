@@ -762,7 +762,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
                     # individually (read in setup_envvars_for_vllm, in the engine actor). Plus the
                     # diagnostic-gating flag. All read inside actors -> must be forwarded here.
                     "SKYRL_ZEROKL_ENABLE_PREFIX_CACHE", "SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL",
-                    "SKYRL_ZEROKL_ENABLE_CUDAGRAPH", "SKYRL_ZEROKL_DEBUG"):
+                    "SKYRL_ZEROKL_ENABLE_CUDAGRAPH", "SKYRL_ZEROKL_DEBUG",
+                    # MoE: set to 0 to A/B the unpatched (batch-variant) expert combine + router
+                    # top-k. Read in zerokl/moe_batch_invariant.py inside BOTH the trainer worker
+                    # and the vLLM engine actor -> must be forwarded to reach either.
+                    "SKYRL_ZEROKL_MOE_DETERMINISTIC"):
             if os.environ.get(_zk):
                 env_vars[_zk] = os.environ[_zk]
 

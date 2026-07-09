@@ -396,6 +396,14 @@ class MegatronWorker:
             for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
                 transformer_config_kwargs[key] = None
 
+        # SkyRL-ZeroKL: megatron-bridge's OLMoE mapping names only the grouped-GEMM expert params,
+        # but the zero-KL MoE recipe pins SequentialMLP. Retarget the mapping BEFORE the bridge is
+        # constructed, else every expert weight silently stays at its random init.
+        if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
+            from skyrl.backends.skyrl_train.zerokl import patch_olmoe_bridge_for_sequential_mlp
+
+            patch_olmoe_bridge_for_sequential_mlp()
+
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
 
         # For Qwen3.5, language_model_only routes to the native GPTModel + GDN
@@ -466,10 +474,13 @@ class MegatronWorker:
         # batch-invariant local-spec model the engine serves -- the basis for bitwise zero-KL.
         # local_layer_spec(config) -> get_gpt_layer_local_spec(normalization=config.normalization,
         # qk_layernorm=config.qk_layernorm, ...), so RMSNorm / no-qk-norm follow the HF config.
+        # For a MoE provider this resolves to get_gpt_layer_local_spec(num_experts=...,
+        # moe_grouped_gemm=False) -> MoELayer(TopKRouter, SequentialMLP) built from local modules,
+        # keeping the model's own SelfAttention class; dense providers are unchanged.
         if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
-            from megatron.bridge.models.gpt_provider import local_layer_spec
+            from skyrl.backends.skyrl_train.zerokl import make_zerokl_local_layer_spec
 
-            provider.transformer_layer_spec = local_layer_spec
+            provider.transformer_layer_spec = make_zerokl_local_layer_spec(provider)
             print("[ZEROKL-TRAINER] forced Megatron LOCAL layer spec (no TransformerEngine)", flush=True)
         # Apply explicit MoE config fields to the provider.
         # These replace the previously hardcoded values and can be further
@@ -488,6 +499,16 @@ class MegatronWorker:
         # Apply any additional transformer config kwargs (can override the above).
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
+
+        # SkyRL-ZeroKL: pin the MoE recipe LAST so neither megatron_config nor
+        # transformer_config_kwargs can reintroduce a batch-variant op (grouped GEMM, permute
+        # fusion, token dropping). Also installs the deterministic combine / sorted router top-k.
+        # Must be byte-for-byte the same forcing the engine applies in gptmodel_vllm. No-op dense.
+        if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
+            from skyrl.backends.skyrl_train.zerokl import prepare_zerokl_moe
+
+            prepare_zerokl_moe(provider, side="TRAINER")
+
         provider.finalize()
 
         self.provider = provider
