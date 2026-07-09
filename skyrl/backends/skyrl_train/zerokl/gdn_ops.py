@@ -95,6 +95,53 @@ def gdn_causal_conv(
     return y, final_state
 
 
+def gdn_causal_conv_batched(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+) -> torch.Tensor:
+    """Batched :func:`gdn_causal_conv`: ``x [N, T, D]``, ``initial_state [N, D, W-1]`` -> ``y [N, T, D]``.
+
+    The SAME elementwise shifted-sum expression with a leading batch dim, so ``y[i]`` is
+    bitwise-identical to ``gdn_causal_conv(x[i], ..., initial_state[i])``: every op is elementwise
+    over (batch, token), fp32-accumulated in the same fixed order. This is what lets
+    chunk-consistent decode run ONE conv over all open chunks instead of a per-slot python loop
+    (the dominant decode cost at high concurrency) without a bitwise re-qualification of a fused
+    kernel.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"gdn_causal_conv_batched expects x=[N, T, D], got {tuple(x.shape)}")
+    N, T, D = x.shape
+    W = weight.shape[-1]
+    if weight.shape[0] != D:
+        raise ValueError(f"weight {tuple(weight.shape)} incompatible with x dim {D}")
+
+    if initial_state is None:
+        pad = x.new_zeros(N, W - 1, D)
+    else:
+        if initial_state.shape != (N, D, W - 1):
+            raise ValueError(
+                f"initial_state must be [N, D, W-1]={(N, D, W - 1)}, got {tuple(initial_state.shape)}")
+        pad = initial_state.transpose(1, 2).to(x.dtype)  # [N, W-1, D], oldest first
+    xp = torch.cat([pad, x], dim=1)  # [N, T + W - 1, D]
+
+    acc = torch.zeros(N, T, D, dtype=torch.float32, device=x.device)
+    wf = weight.float()
+    for i in range(W):
+        acc = acc + wf[:, i].unsqueeze(0).unsqueeze(0) * xp[:, i : i + T].float()
+    if bias is not None:
+        acc = acc + bias.float().unsqueeze(0).unsqueeze(0)
+
+    if activation in ("silu", "swish"):
+        acc = acc * torch.sigmoid(acc)
+    elif activation is not None:
+        raise ValueError(f"unsupported activation {activation!r}")
+    return acc.to(x.dtype)
+
+
 L2NORM_EPS = 1e-6
 
 

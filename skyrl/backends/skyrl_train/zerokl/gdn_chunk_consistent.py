@@ -55,11 +55,22 @@ booting vLLM. The vLLM wiring lives separately.
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import torch
 
-from .gdn_ops import gdn_causal_conv, gdn_chunk, gdn_gate_and_beta, gdn_l2norm
+from .gdn_ops import (
+    gdn_causal_conv,
+    gdn_causal_conv_batched,
+    gdn_chunk,
+    gdn_gate_and_beta,
+    gdn_l2norm,
+)
+
+# Batched decode (one conv + one ragged gather instead of a per-slot python loop) -- bitwise-equal
+# by construction (see decode()); the flag exists only for A/B against the original loop.
+_BATCHED_DECODE = os.environ.get("SKYRL_ZEROKL_GDN_BATCHED_DECODE", "1") == "1"
 
 
 class ChunkConsistentGDN:
@@ -236,24 +247,53 @@ class ChunkConsistentGDN:
         fills = fills + 1
         self.fill[bufs] = fills.to(torch.int32)
 
-        qs, ks, vs, gs, bs, lens = [], [], [], [], [], []
-        for i in range(N):
-            s = int(bufs[i])
-            n = int(fills[i])
-            q, k, v, g, beta, _ = self._prep(
-                self.x_buf[s, :n], self.a_buf[s, :n], self.b_buf[s, :n], self.conv_state0[s]
-            )
-            qs.append(q); ks.append(k); vs.append(v); gs.append(g); bs.append(beta); lens.append(n)
-
+        lens = fills.tolist()
         cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=x.device)
-        cat = lambda ts: torch.cat(ts, dim=0).unsqueeze(0)  # noqa: E731  -> [1, sum(lens), ...]
         need_state = any(n == C for n in lens)
-        o, final_state = gdn_chunk(
-            cat(qs), cat(ks), cat(vs), cat(gs), cat(bs),
-            initial_state=self.ssm_state0[bufs], output_final_state=need_state, cu_seqlens=cu,
-        )
 
-        out = torch.stack([o[0, int(cu[i + 1]) - 1] for i in range(N)], dim=0)
+        if _BATCHED_DECODE:
+            # ONE conv over all open chunks (batched over the padded buffers), then a vectorized
+            # ragged gather of the valid rows in slot order. Replaces the per-slot python loop,
+            # which at high concurrency dominates decode (N slots x layers python iterations per
+            # token). Bitwise-identical: the batched conv is the same elementwise expression per
+            # slot (gdn_causal_conv_batched); rows >= fill are stale but causally isolated (row t
+            # reads only rows t-W+1..t of the SAME slot) and are dropped by the gather; l2norm is
+            # row-local and the gate math elementwise, so concatenation cannot change any row.
+            y_pad = gdn_causal_conv_batched(
+                self.x_buf[bufs], self.conv_weight, self.conv_bias,
+                initial_state=self.conv_state0[bufs], activation=self.activation,
+            )  # [N, C, D]
+            lens_dev = fills.to(self.fill.device)
+            i_rep = torch.arange(N, device=lens_dev.device).repeat_interleave(lens_dev)   # [T]
+            cu_dev = cu.to(lens_dev.device).long()
+            pos = torch.arange(int(cu[-1]), device=lens_dev.device) - cu_dev[:-1].repeat_interleave(lens_dev)
+            y_cat = y_pad[i_rep, pos]                                # [T, D]
+            buf_rep = bufs[i_rep]
+            a_cat = self.a_buf[buf_rep, pos]                         # [T, Hv]
+            b_cat = self.b_buf[buf_rep, pos]
+            q, k, v = self._split_qkv(y_cat)
+            g, beta = gdn_gate_and_beta(a_cat, b_cat, self.A_log, self.dt_bias)
+            o, final_state = gdn_chunk(
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
+                initial_state=self.ssm_state0[bufs], output_final_state=need_state, cu_seqlens=cu,
+            )
+            out = o[0, cu_dev[1:] - 1]                               # last row per sequence
+        else:
+            qs, ks, vs, gs, bs = [], [], [], [], []
+            for i in range(N):
+                s = int(bufs[i])
+                n = int(fills[i])
+                q, k, v, g, beta, _ = self._prep(
+                    self.x_buf[s, :n], self.a_buf[s, :n], self.b_buf[s, :n], self.conv_state0[s]
+                )
+                qs.append(q); ks.append(k); vs.append(v); gs.append(g); bs.append(beta)
+
+            cat = lambda ts: torch.cat(ts, dim=0).unsqueeze(0)  # noqa: E731  -> [1, sum(lens), ...]
+            o, final_state = gdn_chunk(
+                cat(qs), cat(ks), cat(vs), cat(gs), cat(bs),
+                initial_state=self.ssm_state0[bufs], output_final_state=need_state, cu_seqlens=cu,
+            )
+            out = torch.stack([o[0, int(cu[i + 1]) - 1] for i in range(N)], dim=0)
 
         # roll every chunk that just filled: its final_state is a point on the chunk grid
         for i in range(N):
