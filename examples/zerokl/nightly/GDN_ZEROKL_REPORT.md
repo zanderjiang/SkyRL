@@ -25,8 +25,9 @@ production engine (Megatron `GPTModel` running inside vLLM) has no GDN/mamba sta
 | 5 | Rollout cost of chunk-consistent decode | **5.78x** slower at 16 seqs (1.96x at 1 seq) | `/mnt/local_storage/logs/gdn_rollout_cost.log` |
 | 3.1 | Engine parity on Qwen3.5-0.8B through the GPTModel-in-vLLM wrapper | **PASS** -- coherent AND 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_gate31_hybrid.log` |
 | T | Trainer builds the real Qwen3.5 hybrid, loads it, fwd+bwd | **PASS** -- 18 GDN + 6 attn; predicts `' Rome'`, prompt CE 1.321 | `/mnt/local_storage/logs/gdn_trainer_model.log` |
+| M | MoE branch of the hybrid spec + expert weight mapping | **PASS** -- SequentialMLP names matched; GDN+MoE forward | `/mnt/local_storage/logs/gdn_moe_hybrid_spec.log` |
 | 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** | -- |
-| 3.3 | Live 5-step DP8 run on Qwen3.5-0.8B | **NOT RUN** | -- |
+| 3.3 | Live DP8 run on Qwen3.5-0.8B + GSM8K | **RUNNING** -- `run_megatron_qwen3.5_0.8b_gsm8k_zerokl_nightly.sh` | `/mnt/local_storage/logs/zerokl_gsm8k_qwen35_0.8b.log` |
 
 > **A near-miss worth recording.** An earlier Gate 3.1 run reported `256/256 bitwise, max 0.0` and
 > the number was worthless: the generation check in the same log read
@@ -348,10 +349,18 @@ all-ones, and the model completes `Italy is` with ` Rome`).
   `policy_kl == 0.0`. A clean step 1 with a dirty step 2 is the sleep/wake weight-clobber class of
   bug, not a GDN bug -- set `SKYRL_ZEROKL_DEBUG=1` and check
   `[ZEROKL-REAPPLY] == [SENDER] == [ZEROKL-ENGFWD]`.
-* **`Qwen/Qwen3.5-35B-A3B-Base` is not downloaded** on this box (28T free, so not a capacity issue).
-  It is also MoE, so it additionally exercises `make_zerokl_hybrid_local_spec`'s MoE branch
-  (`num_experts` is threaded through to `get_gpt_layer_local_spec`) and the `_get_moe_lm_mappings`
-  retarget -- neither has been run.
+* **Qwen3.5-35B-A3B needs matched TP=8, and the unified engine is TP=1-scoped.** This is the real
+  blocker for the 35B run, and it is not a GDN problem -- the GDN stack is TP-agnostic.
+  `gptmodel_vllm.py` hard-codes `mp.tensor_model_parallel_size = 1` (its docstring: "TP=1 bring-up"),
+  and `native_weight_sync.py` says "Scope: TP=1 parity path (DTensors are materialized via
+  `full_tensor`)". At TP=1 the 35B's ~70 GB of bf16 weights would have to be held twice (trainer +
+  colocated engine) on one 80 GB GPU. Supporting TP>1 in the unified GPTModel-in-vLLM path, plus a
+  sharded native weight sync, is a separate workstream. The model IS now downloaded
+  (`/mnt/local_storage/hf`, 67 GB).
+* **MoE-hybrid**: the spec and mapping branches are validated on a toy
+  (`gdn_moe_hybrid_spec_test.py`), not on the 35B itself. Retargeting the expert mapping was
+  necessary: megatron-bridge declares only the grouped-GEMM names while the zero-KL recipe pins
+  SequentialMLP, so all 256 experts per layer would have stayed at their random init -- silently.
 * **The 5.78x rollout cost.** Batch `ChunkConsistentGDN.decode`'s per-slot `_prep` before any
   large-scale run: it is bitwise-safe by construction (conv is elementwise, l2norm row-local), and at
   35B's concurrency the per-slot python loop will dominate.
