@@ -193,12 +193,17 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
                     model._zk_fwd_ck_pending = True
                 except Exception:
                     pass
-                # checksum of the LIVE engine gpt params (after this sync) -- compare to SENDER cksum
-                _eng = 0.0
-                for _n, _p in target.named_parameters():
-                    if _p.device.type != "meta":
-                        _eng += float(_p.float().double().abs().sum())
-                print(f"[ZEROKL-CKSUM] RECEIVER recv-abs-sum={self._zk_recv_ck:.6f} engine-gpt-abs-sum={_eng:.6f}", flush=True)
+                # The full engine-gpt abs-sum walks EVERY param (20,943 kernels on 35B-A3B) -- per
+                # chunk that dominated the sync. It is redundant with the once-per-sync
+                # [ZEROKL-REAPPLY] total; keep it opt-in for small-model bisects.
+                if _os.environ.get("SKYRL_ZEROKL_DEBUG_PER_CHUNK") == "1":
+                    _eng = 0.0
+                    for _n, _p in target.named_parameters():
+                        if _p.device.type != "meta":
+                            _eng += float(_p.float().double().abs().sum())
+                    print(f"[ZEROKL-CKSUM] RECEIVER recv-abs-sum={self._zk_recv_ck:.6f} engine-gpt-abs-sum={_eng:.6f}", flush=True)
+                else:
+                    print(f"[ZEROKL-CKSUM] RECEIVER recv-abs-sum={self._zk_recv_ck:.6f}", flush=True)
                 _p = next((p for n, p in target.named_parameters() if "weight" in n), None)
                 _wn = float(_p.float().norm()) if (_p is not None and _p.device.type != "meta") else -1.0
                 print(f"[ZEROKL-SYNC] copied {copied} (materialized {materialized}, cum {self._zerokl_copied}) "

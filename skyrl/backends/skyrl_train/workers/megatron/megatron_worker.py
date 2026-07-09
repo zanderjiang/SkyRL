@@ -293,16 +293,46 @@ class MegatronWeightExtractor(WeightExtractor):
 
         # SkyRL-ZeroKL: the rollout runs the SAME GPTModel, so sync NATIVE params (no HF
         # conversion). The receiver copies them straight into GPTModelVLLMWrapper.gpt by name.
-        # (TP=1: named_parameters are full. TP>1 needs a TP-gather here -- see ZEROKL_SKYRL_INTEGRATION.md.)
+        # At TP>1 named_parameters are the per-rank shards, which is exactly what the colocated
+        # engine rank needs (the CUDA-IPC transport routes by physical GPU).
+        #
+        # BUCKET many params per chunk: each chunk costs a pack + IPC handle + all_gather_object +
+        # collective_rpc + barriers across all engine workers. One-chunk-per-param was fine for
+        # dense 0.8B (230 params) but Qwen3.5-35B-A3B's SequentialMLP has 20,943 -- measured ~90
+        # minutes per sync. The IPC request natively carries (names, shapes, sizes) lists, so
+        # packing is purely a sender-side choice.
         if os.environ.get("SKYRL_ZERO_KL") == "1":
             from skyrl.backends.skyrl_train.zerokl.native_weight_sync import extract_native_weights
 
-            _n = 0
+            bucket_bytes = int(os.environ.get("SKYRL_ZEROKL_SYNC_BUCKET_MB", "512")) * 1024 * 1024
+            names, dtypes_l, shapes, tensors, cur = [], [], [], [], 0
+            _n_params, _n_chunks = 0, 0
+
+            def _flush():
+                nonlocal names, dtypes_l, shapes, tensors, cur, _n_chunks
+                if not names:
+                    return None
+                chunk = WeightChunk(names=names, dtypes=dtypes_l, shapes=shapes, tensors=tensors)
+                names, dtypes_l, shapes, tensors, cur = [], [], [], [], 0
+                _n_chunks += 1
+                return chunk
+
             for name, tensor in extract_native_weights(self.actor_module, dtype=dtype):
                 tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
-                _n += 1
-                yield WeightChunk(names=[name], dtypes=[str(dtype)], shapes=[list(tensor.shape)], tensors=[tensor])
-            print(f"[ZEROKL-SENDER] extract_weights NATIVE yielded {_n} chunks", flush=True)
+                sz = tensor.numel() * tensor.element_size()
+                if cur and cur + sz > bucket_bytes:
+                    yield _flush()
+                names.append(name)
+                dtypes_l.append(str(dtype))
+                shapes.append(list(tensor.shape))
+                tensors.append(tensor)
+                cur += sz
+                _n_params += 1
+            last = _flush()
+            if last is not None:
+                yield last
+            print(f"[ZEROKL-SENDER] extract_weights NATIVE yielded {_n_params} params in "
+                  f"{_n_chunks} bucketed chunks (<= {bucket_bytes >> 20} MiB each)", flush=True)
             return
 
         if not self.enable_bucketing:
