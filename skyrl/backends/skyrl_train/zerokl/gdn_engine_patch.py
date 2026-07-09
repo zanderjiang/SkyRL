@@ -86,6 +86,25 @@ def assert_engine_args_compatible(kwargs: dict) -> None:
         )
 
 
+def lift_gdn_batch_invariance_veto() -> None:
+    """Let ``VLLM_BATCH_INVARIANT=1`` coexist with GDN. Idempotent.
+
+    vLLM's ``get_mamba_attn_backend`` raises "batch_invariant mode is not supported for GDN_ATTN"
+    because its stock decode is a recurrent kernel with no batch-invariant form. With
+    chunk-consistent decode the GDN layers ARE batch-invariant (pinned autotune configs; asserted by
+    ``gdn_batch_invariant.verify_gdn_batch_invariance``). Without lifting the veto the model's
+    softmax-attention layers can never be made invariant either, and they carry their own ~1e-2
+    decode-vs-prefill gap.
+
+    Both engines need this: vLLM's native GDN class and the Megatron GPTModel running inside vLLM.
+    ``_cached_get_mamba_attn_backend`` is ``@cache``d, so this must run before the backend is first
+    resolved (KV-cache spec collection, i.e. after model init).
+    """
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+
+    GDNAttentionBackend.supports_batch_invariance = classmethod(lambda cls: True)
+
+
 def _get_layer_state(self):
     """Lazily build this layer's ChunkConsistentGDN, sized from the engine's own slot count.
 
@@ -249,15 +268,7 @@ def install_gdn_engine_patch(*, force: bool = False) -> bool:
     QwenGatedDeltaNetAttention.__init__ = _init
     QwenGatedDeltaNetAttention._forward_core = _zerokl_forward_core
 
-    # vLLM refuses VLLM_BATCH_INVARIANT=1 for GDN ("batch_invariant mode is not supported for
-    # GDN_ATTN") because its stock decode is a recurrent kernel with no batch-invariant form. With
-    # chunk-consistent decode the GDN layers ARE batch-invariant (pinned configs; asserted by
-    # gdn_batch_invariant.verify_gdn_batch_invariance), so lift the veto -- otherwise the model's
-    # softmax-attention layers can never be made invariant either, and they carry their own ~1e-2
-    # decode-vs-prefill gap.
-    from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
-
-    GDNAttentionBackend.supports_batch_invariance = classmethod(lambda cls: True)
+    lift_gdn_batch_invariance_veto()
     # Belt and braces: the packed recurrent decode fast path is what we are replacing. Our
     # _forward_core never consults this flag, but leaving it True would mislead anyone reading state.
     QwenGatedDeltaNetAttention.enable_packed_recurrent_decode = False

@@ -226,9 +226,13 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
         return 0
 
     from .gdn_batch_invariant import pin_fla_autotune_configs, pin_gdn_rmsnorm_rows_per_block
+    from .gdn_engine_patch import lift_gdn_batch_invariance_veto
 
     pin_fla_autotune_configs()
     pin_gdn_rmsnorm_rows_per_block()
+    # The GDN layers are batch-invariant under chunk-consistent decode, so let the rest of the model
+    # (softmax attention, GEMMs, log_softmax) be made invariant too.
+    lift_gdn_batch_invariance_veto()
 
     cls = state_layer_cls()
     n = 0

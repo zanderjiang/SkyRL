@@ -30,7 +30,13 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
-VLLM_MODEL_NAME = "MegatronGPTModelForCausalLM"
+_DENSE_MODEL_NAME = "MegatronGPTModelForCausalLM"
+_HYBRID_MODEL_NAME = "MegatronGPTModelHybridForCausalLM"
+# The hybrid (GatedDeltaNet) wrapper must be a DIFFERENT class with a DIFFERENT registered name:
+# vLLM caches each model's `_ModelInfo` (which carries `is_hybrid`) to
+# ~/.cache/vllm/modelinfos/<module>-<class>.json, so one class cannot be hybrid on some runs and
+# dense on others -- the first run's answer sticks and breaks the next model.
+VLLM_MODEL_NAME = _HYBRID_MODEL_NAME if os.environ.get("SKYRL_ZEROKL_GDN") == "1" else _DENSE_MODEL_NAME
 TORCHTITAN_LIKE_CONFIG_FORMAT = "megatron_gptmodel"
 
 
@@ -177,6 +183,43 @@ class GPTModelVLLMWrapper(nn.Module):
     # rewrite the HF config. `forward` collapses the [3, T] positions back to one row.
     supports_mrope = True
 
+    # NOTE: `is_hybrid` is NOT set here. vLLM caches the model's `_ModelInfo` to
+    # ~/.cache/vllm/modelinfos/<module>-<class>.json, keyed by module+class name and validated only
+    # against the source hash -- so an env-dependent `is_hybrid` on THIS class gets baked into the
+    # cache by a GDN run and then poisons the next dense run ("'MiMoConfig' object has no attribute
+    # 'linear_num_key_heads'"). The hybrid flag lives on the separate subclass below, which has its
+    # own cache file.
+
+    # vLLM's `Platform.update_block_size_for_backend` reconciles the attention page size with the
+    # mamba page size (it is what logs "Setting attention block size to N tokens" / "Padding mamba
+    # page size by X%"). It reads the mamba state geometry from these two CLASSMETHODS on the model
+    # class, before any layer exists. Without them the attention and GDN page sizes never unify and
+    # the KV cache manager dies with "page size ... not divisible by the maximum page size".
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+
+        hf = vllm_config.model_config.hf_text_config
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            vllm_config.parallel_config.tensor_parallel_size,
+            hf.linear_num_key_heads,
+            hf.linear_num_value_heads,
+            hf.linear_key_head_dim,
+            hf.linear_value_head_dim,
+            hf.linear_conv_kernel_dim,
+            0,  # chunk-consistent decode forbids speculative decoding
+        )
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
     def get_mrope_input_positions(self, input_tokens, mm_features=None, **kwargs):
         if mm_features:
             raise RuntimeError("[zerokl] the GPTModel path is text-only; got multimodal features")
@@ -222,7 +265,17 @@ class GPTModelVLLMWrapper(nn.Module):
             from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
                 maybe_force_qwen35_text_bridge,
             )
+            from skyrl.backends.skyrl_train.zerokl.gdn_hybrid_spec import (
+                checkpoint_is_vl_named, patch_qwen35_bridge_for_local_spec,
+            )
 
+            # Read VL-ness BEFORE the sentinel rewrite: the released Qwen3.5 checkpoints are
+            # VL-architected and store the LM under `model.language_model.`, but the text bridge we
+            # are about to select builds HF names as `model.`.
+            vl = checkpoint_is_vl_named(b.hf_pretrained.config)
+            patch_qwen35_bridge_for_local_spec(
+                hf_lm_prefix="model.language_model." if vl else None
+            )
             if maybe_force_qwen35_text_bridge(b, b.hf_pretrained.config):
                 print("[ZEROKL-WRAP] forced Qwen3.5 TEXT bridge (GPTModel + GDN, not the VL model)",
                       flush=True)
@@ -467,7 +520,23 @@ class GPTModelVLLMWrapper(nn.Module):
         return all_names
 
 
-_WRAPPER_IMPORT_PATH = "skyrl.backends.skyrl_train.zerokl.gptmodel_vllm:GPTModelVLLMWrapper"
+class GPTModelVLLMHybridWrapper(GPTModelVLLMWrapper):
+    """The wrapper for GatedDeltaNet hybrids (Qwen3.5). Identical compute; only the flag differs.
+
+    ``is_hybrid`` tells vLLM to reconcile the attention and mamba page sizes and to set
+    ``cache_config.mamba_block_size``. It is read off the CLASS before any instance exists, and the
+    answer is cached to disk per class name -- hence a separate class rather than an env-dependent
+    attribute on the dense one.
+    """
+
+    is_hybrid = True
+
+
+_WRAPPER_IMPORT_PATH = (
+    "skyrl.backends.skyrl_train.zerokl.gptmodel_vllm:GPTModelVLLMHybridWrapper"
+    if os.environ.get("SKYRL_ZEROKL_GDN") == "1"
+    else "skyrl.backends.skyrl_train.zerokl.gptmodel_vllm:GPTModelVLLMWrapper"
+)
 
 
 def register_gptmodel_to_vllm(model_path: str | None = None):
@@ -481,8 +550,9 @@ def register_gptmodel_to_vllm(model_path: str | None = None):
     """
     from vllm.model_executor.models.registry import ModelRegistry
 
+    base = GPTModelVLLMHybridWrapper if VLLM_MODEL_NAME == _HYBRID_MODEL_NAME else GPTModelVLLMWrapper
     if model_path is not None:  # legacy closure form (single-process / standalone tests)
-        class _Wrapper(GPTModelVLLMWrapper):
+        class _Wrapper(base):
             def __init__(self, *, vllm_config, prefix=""):
                 super().__init__(model_path=model_path, vllm_config=vllm_config, prefix=prefix)
         _Wrapper.__name__ = VLLM_MODEL_NAME
@@ -491,6 +561,18 @@ def register_gptmodel_to_vllm(model_path: str | None = None):
     else:  # cross-process string form (SkyRL mp/async workers)
         ModelRegistry.register_model(VLLM_MODEL_NAME, _WRAPPER_IMPORT_PATH)
     logger.info("[zerokl] registered %s into vLLM ModelRegistry", VLLM_MODEL_NAME)
+
+    # Hybrid (GDN) models need vLLM's hybrid config pass: it is what sets
+    # `cache_config.mamba_block_size` (without it `MambaBase.get_kv_cache_spec` asserts) and lets
+    # the platform reconcile the attention and mamba page sizes. vLLM selects that pass by
+    # ARCHITECTURE NAME, and `hf_overrides` has just replaced the architecture with ours.
+    if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+        from vllm.model_executor.models.config import (
+            MODELS_CONFIG_MAP, HybridAttentionMambaModelConfig,
+        )
+
+        MODELS_CONFIG_MAP.setdefault(VLLM_MODEL_NAME, HybridAttentionMambaModelConfig)
+        logger.info("[zerokl] %s -> HybridAttentionMambaModelConfig (mamba_block_size)", VLLM_MODEL_NAME)
     return VLLM_MODEL_NAME
 
 

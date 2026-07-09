@@ -19,18 +19,21 @@ production engine (Megatron `GPTModel` running inside vLLM) has no GDN/mamba sta
 |---|------|--------|-----|
 | 1 | Megatron GDN builds + thd fwd/bwd, forward bitwise == `gdn_ops` | **PASS**, max \|diff\| `0.000e+00` | `/mnt/local_storage/logs/gdn_gate1.log` |
 | 2 | Engine decode == prefill, Qwen3.5-0.8B, 32x2048 @ temp 1.0 | **PASS**, 65536/65536 exact, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_divergence_patched.log` |
-| R1 | Regression: MiMo-7B dense engine parity | **PASS**, 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_regress_dense_mimo.log` |
-| R2 | Regression: OLMoE-1B-7B MoE engine parity | **PASS**, 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_regress_moe_olmoe.log` |
+| R1 | Regression: MiMo-7B dense engine parity | **PASS**, coherent + 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_regress_dense_final.log` |
+| R2 | Regression: OLMoE-1B-7B MoE engine parity | **PASS**, coherent + 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_regress_moe_final.log` |
 | R3 | Regression: GDN layer decode parity after the LRU refactor | **PASS**, 450/450 bitwise | `/mnt/local_storage/logs/gdn_layer_parity_recheck.log` |
 | 5 | Rollout cost of chunk-consistent decode | **5.78x** slower at 16 seqs (1.96x at 1 seq) | `/mnt/local_storage/logs/gdn_rollout_cost.log` |
-| 3.1 | Engine parity on Qwen3.5 through the GPTModel-in-vLLM wrapper | **FAIL** -- the wrapper builds the wrong model (see below) | `/mnt/local_storage/logs/gdn_gate31_qwen35.log` |
-| 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** -- blocked on 3.1 | -- |
-| 3.3 | Live 5-step DP8 run on Qwen3.5-0.8B | **NOT RUN** -- blocked on 3.1 | -- |
+| 3.1 | Engine parity on Qwen3.5-0.8B through the GPTModel-in-vLLM wrapper | **PASS** -- coherent AND 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_gate31_hybrid.log` |
+| 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** | -- |
+| 3.3 | Live 5-step DP8 run on Qwen3.5-0.8B | **NOT RUN** | -- |
 
-> **Gate 3.1 reported `256/256 bitwise, max 0.0` and that number is worthless.** The generation
-> check in the same log reads `'The capital of France is' -> ' 0 -s\n\n(3 192=".,)5S;'`. A model with
-> the wrong weights is trivially self-consistent between its own decode and its own prefill. The
-> `[GEN]` line is why the test prints it. See [What is NOT done](#what-is-not-done).
+> **A near-miss worth recording.** An earlier Gate 3.1 run reported `256/256 bitwise, max 0.0` and
+> the number was worthless: the generation check in the same log read
+> `'The capital of France is' -> ' 0 -s\n\n(3 192=".,)5S;'`. The no-TE layer spec had built 24 dense
+> attention layers instead of 18 GDN + 6 attention, so the model loaded none of the checkpoint's GDN
+> weights -- and a model with the wrong weights is trivially self-consistent between its own decode
+> and its own prefill. The `[GEN]` line is why the test prints it. `gptmodel_vllm` now **raises** when
+> `SKYRL_ZEROKL_GDN=1` and zero GDN layers are found.
 
 ---
 
@@ -223,74 +226,102 @@ chunk grid the recurrent state is pinned to. It was not changed.
 
 ---
 
-## What is NOT done
+## Gate 3.1 -- Qwen3.5 through the production engine
 
-**Part 3 items 1-3 are blocked, and not on GDN math.** The GDN work is finished: the ops, the
-chunk-consistent decode, the invariance pins, and the trainer shim are all built and measured. What
-is missing is the ability to *construct the Qwen3.5 model at all* on the no-TransformerEngine stack.
+```
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=examples/zerokl/nightly/_torchvision_stub \
+  HF_HOME=/mnt/local_storage/hf SKYRL_ZEROKL_GDN=1 PARITY_TEMP=1.0 PARITY_MM_ZERO=1 \
+  PARITY_MAX_NUM_SEQS=8 ZEROKL_MODEL=Qwen/Qwen3.5-0.8B \
+  uv run --isolated --extra zerokl python examples/zerokl/nightly/skyrl_engine_parity_test.py \
+  > /mnt/local_storage/logs/gdn_gate31_hybrid.log 2>&1
+```
 
-Gate 2 patches vLLM's *native* `QwenGatedDeltaNetAttention`. SkyRL's production rollout engine is not
-that class -- it is `zerokl/gptmodel_vllm.py`, which runs Megatron's `GPTModel` inside vLLM.
+```
+[ZEROKL-SPEC] hybrid local spec: 18 GatedDeltaNet + 6 attention layers (no TransformerEngine)
+[ZEROKL-GDN] swapped 18 Megatron GatedDeltaNet layer(s) -> chunk-consistent decode
+[GEN] 'The capital of France is' -> ' Paris.\nThe capital of France is Paris. ...'
+MAX |decode - prefill| over 256 tokens = 0.000000e+00
+tokens EXACT 0.0: 256/256
+RESULT: BITWISE-IDENTICAL (max==0)
+```
 
-Substantial progress was made and is committed. `zerokl/gdn_gptmodel.py` now provides the
-`swap_gdn_core` analogue of `swap_core_attention`: a `ZeroKLGDNStateLayer` (a real `MambaBase`, since
-vLLM enumerates KV-cache layers with an `isinstance` filter) that gets vLLM to reserve mamba state
-slots and emit `GDNAttentionMetadata`, plus a replacement `GatedDeltaNet.forward` that keeps every
-Megatron module and routes only the conv+chunk core through `ChunkConsistentGDN`. Four further
-blockers were found and fixed on the way, each verified by the next failure moving forward:
+`zerokl/gdn_gptmodel.py` is the `swap_core_attention` analogue for GatedDeltaNet:
+`ZeroKLGDNStateLayer` is a real `MambaBase` (vLLM enumerates KV-cache layers with an `isinstance`
+filter, so duck typing leaves the layer invisible and the engine runs with empty GDN metadata). It
+exists to make vLLM reserve mamba slots and emit `GDNAttentionMetadata`; its `kv_cache` tensors are
+deliberately unused, because `ssm_state[slot]` now means "state at the last chunk boundary".
+`_gdn_inference_forward` keeps every Megatron module and routes only the conv+chunk core through
+`ChunkConsistentGDN`.
+
+`zerokl/gdn_hybrid_spec.py` supplies the hybrid **no-TE** layer spec. Megatron's own
+`get_transformer_block_with_experimental_attention_variant_spec` asserts
+`transformer_impl == "transformer_engine"`, and its GDN spec asks the backend for
+`column_parallel_layer_norm_linear()` -- TE's fused layernorm+linear, which `LocalSpecProvider`
+answers `None`. We assemble the block from local modules instead: `in_proj = ColumnParallelLinear`
+with a separate `input_layernorm`, exactly the layer Gate 1 validates.
+
+Seven blockers, each found by running it and fixed in turn:
 
 1. `fla.__spec__ is None` -> `importlib.util.find_spec` raised inside
-   `transformers.is_flash_linear_attention_available()`. The facade now carries a real `ModuleSpec`,
-   and declares `__version__ = "0.0.0"` so HF answers "no FLA" and never tries to import
+   `transformers.is_flash_linear_attention_available()`. The facade now carries a real `ModuleSpec`
+   and declares `__version__ = "0.0.0"`, so HF answers "no FLA" and never imports
    `fused_recurrent_gated_delta_rule` from it.
-2. The bridge dispatched to the Qwen3.5 **VL** model. `maybe_force_qwen35_text_bridge` is now applied
-   in the wrapper too, as `megatron_worker` already does.
-3. `layernorm_zero_centered_gamma`. Qwen3.5 normalises with `rms(x) * (1 + w)`; Megatron's no-TE
+2. The bridge dispatched to the Qwen3.5 **VL** model; force the text bridge in the wrapper too.
+3. `layernorm_zero_centered_gamma`. Qwen3.5 normalises `rms(x) * (1 + w)`; Megatron's no-TE
    `WrappedTorchNorm` asserts against the flag. `zerokl/zero_centered_norm.py` implements it for both
    runtimes.
 4. **M-RoPE.** Qwen3.5's config carries `rope_parameters.mrope_section`, so vLLM feeds `[3, T]`
-   positions and requires the model to implement `SupportsMRoPE`. The wrapper now satisfies that
-   protocol and collapses the three (identical, for text) sections to one row.
+   positions and requires `SupportsMRoPE`. The wrapper satisfies the protocol and collapses the
+   three (identical, for text) sections.
+5. **No hybrid spec** -- the model came out as 24 dense layers. See the near-miss box above.
+6. **Bridge weight mapping.** `qwen35_bridge` maps
+   `self_attention.in_proj.layer_norm_weight` (TE's fused parameter, absent under the local spec) and
+   builds HF names as `model.layers.*` while the checkpoint stores `model.language_model.layers.*`.
+   Both retargeted. Also `ChunkedMapping.get_shard_idx` builds its index tensors with a bare
+   `torch.arange`, which lands on the GPU inside vLLM's default-device context while the HF weights
+   are still on the CPU -- pinned to CPU (the subclasses shadow the base, so all of them need it).
+7. **vLLM's hybrid plumbing.** `cache_config.mamba_block_size` is only set for architectures in
+   `MODELS_CONFIG_MAP`, and the attention/mamba page-size reconciliation is gated on the model
+   class's `is_hybrid` and reads its `get_mamba_state_{shape,dtype}_from_config` classmethods --
+   all before any layer exists. All three registered/implemented.
+8. **The modelinfo cache.** `is_hybrid` was first written as an env-dependent class attribute on the
+   one wrapper. That silently broke the *next* run of a different model:
 
-**The remaining blocker: there is no hybrid no-TE layer spec.** `make_zerokl_local_layer_spec` has no
-hybrid branch -- it returns megatron-bridge's flat `local_layer_spec`, which builds a dense
-`SelfAttention` for *every* layer. The log proves it: `swapped core_attention -> vLLM paged Attention
-on 24 layers`, and `swap_gdn_core` found **zero** `GatedDeltaNet` modules to swap. The engine
-therefore built a 24-layer dense model, loaded none of the checkpoint's GDN weights
-(`copied 0 native tensors`), and generated gibberish -- while reporting `256/256 bitwise`.
-`gptmodel_vllm` now **raises** when `SKYRL_ZEROKL_GDN=1` and zero GDN layers are found, so this class
-of silent wrong-model can never be reported as a pass again.
+   ```
+   AttributeError: 'MiMoConfig' object has no attribute 'linear_num_key_heads'
+   ```
 
-Two things are needed, in this order:
+   vLLM persists each model's `_ModelInfo` -- which carries `is_hybrid` -- to
+   `~/.cache/vllm/modelinfos/<module>-<class>.json`, keyed by module+class name and validated only
+   against the source hash. A GDN run baked `is_hybrid: true` into the dense wrapper's cache entry,
+   and MiMo then went down the mamba page-size path. Fixed with a separate
+   `GPTModelVLLMHybridWrapper` class (its own cache file) selected at import from the env var.
+   Lesson: a model class's vLLM-visible capabilities must be a property of the CLASS, not of the run.
 
-* **A hybrid no-TE layer spec.** Megatron ships `megatron/core/models/hybrid/hybrid_layer_specs.py`,
-  but its GDN spec asks the backend for `column_parallel_layer_norm_linear()`, which
-  `LocalSpecProvider` returns `None` for (that fused layernorm+linear is a TE module). The local
-  variant must place `in_proj = ColumnParallelLinear` with a separate `input_layernorm`, exactly as
-  `gdn_trainer_shim_test.py::build_layer` already does and Gate 1 validates.
-* **A bridge weight mapping for that spec.** `megatron/bridge/models/qwen/qwen35_bridge.py` maps
-  `decoder.layers.*.self_attention.in_proj.layer_norm_weight` -- the TE fused parameter, which does
-  not exist under the local spec. It also builds HF names as `model.layers.*`, while the Qwen3.5
-  checkpoint (a VL architecture) stores `model.language_model.layers.*`. This is the same class of
-  fix as the existing `patch_olmoe_bridge_for_sequential_mlp`.
+---
 
-Also: `Qwen/Qwen3.5-35B-A3B-Base` is not downloaded on this box (28T free, so not a capacity issue).
+## What is NOT done
 
-Recommended order:
-1. Hybrid no-TE layer spec + Qwen3.5 bridge mapping patch. Verify by generation coherence FIRST
-   (`[GEN]` must be English), then by bitwise parity. A bitwise number from a wrong model is worse
-   than no number.
-2. Gate 3.1 (engine parity on Qwen3.5-0.8B through the wrapper) and 3.2 (trainer-vs-engine parity
-   after native weight sync).
-3. Batch `ChunkConsistentGDN.decode`'s per-slot `_prep` (bitwise-safe; recovers most of the 5.78x).
-   Do this before any large-scale run -- at 35B's concurrency the per-slot loop will dominate.
-4. Live 5-step DP8 on Qwen3.5-0.8B; gate on `policy/rollout_train_logprobs_abs_diff_mean <= 1e-6` at
-   **every** step including 2-5, `policy_kl == 0.0`. A clean step 1 with a dirty step 2 is the
-   sleep/wake weight-clobber class of bug, not a GDN bug -- set `SKYRL_ZEROKL_DEBUG=1` and check
-   `[ZEROKL-REAPPLY] == [SENDER] == [ZEROKL-ENGFWD]`.
-5. Only then Qwen3.5-35B-A3B on GSM8K. Note the launcher's CAVEAT block
-   (`examples/train/zerokl/run_megatron_qwen3.5_35b_a3b_gsm8k_zerokl.sh`) still says the GDN
-   divergence is unresolved; that is now true only of the GPTModel path, not of the GDN algorithm.
+* **Gate 3.2 (trainer-vs-engine parity on Qwen3.5)** has not been run. The trainer side is validated
+  at layer level (Gate 1) and the engine side end to end (Gate 3.1), but native weight sync between
+  the two has not been exercised on a hybrid model.
+* **Gate 3.3 (live 5-step DP8)** has not been run. Gate on
+  `policy/rollout_train_logprobs_abs_diff_mean <= 1e-6` at **every** step including 2-5, and
+  `policy_kl == 0.0`. A clean step 1 with a dirty step 2 is the sleep/wake weight-clobber class of
+  bug, not a GDN bug -- set `SKYRL_ZEROKL_DEBUG=1` and check
+  `[ZEROKL-REAPPLY] == [SENDER] == [ZEROKL-ENGFWD]`.
+* **`Qwen/Qwen3.5-35B-A3B-Base` is not downloaded** on this box (28T free, so not a capacity issue).
+  It is also MoE, so it additionally exercises `make_zerokl_hybrid_local_spec`'s MoE branch
+  (`num_experts` is threaded through to `get_gpt_layer_local_spec`) and the `_get_moe_lm_mappings`
+  retarget -- neither has been run.
+* **The 5.78x rollout cost.** Batch `ChunkConsistentGDN.decode`'s per-slot `_prep` before any
+  large-scale run: it is bitwise-safe by construction (conv is elementwise, l2norm row-local), and at
+  35B's concurrency the per-slot python loop will dominate.
+* The launcher's CAVEAT block (`examples/train/zerokl/run_megatron_qwen3.5_35b_a3b_gsm8k_zerokl.sh`)
+  still says the GDN divergence is unresolved. That is now stale.
+
+Recommended order: Gate 3.2 -> batch `_prep` -> Gate 3.3 on Qwen3.5-0.8B -> download 35B-A3B -> the
+MoE-hybrid spec/mapping path -> GSM8K.
 
 ---
 

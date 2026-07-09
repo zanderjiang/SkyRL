@@ -185,6 +185,14 @@ def make_zerokl_local_layer_spec(provider):
         from megatron.bridge.models.gpt_provider import local_layer_spec
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 
+        from .gdn_hybrid_spec import is_hybrid_gdn, make_zerokl_hybrid_local_spec
+
+        # Qwen3.5 / Qwen3-Next are 3 GatedDeltaNet layers per 1 softmax layer. `local_layer_spec`
+        # would build dense attention for ALL of them -- a different model that loads none of the
+        # checkpoint's GDN weights and is still perfectly bitwise against itself.
+        if is_hybrid_gdn(config):
+            return make_zerokl_hybrid_local_spec(config)
+
         if not provider_is_moe(config):
             return local_layer_spec(config)
 
