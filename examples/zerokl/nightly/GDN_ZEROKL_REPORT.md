@@ -24,6 +24,7 @@ production engine (Megatron `GPTModel` running inside vLLM) has no GDN/mamba sta
 | R3 | Regression: GDN layer decode parity after the LRU refactor | **PASS**, 450/450 bitwise | `/mnt/local_storage/logs/gdn_layer_parity_recheck.log` |
 | 5 | Rollout cost of chunk-consistent decode | **5.78x** slower at 16 seqs (1.96x at 1 seq) | `/mnt/local_storage/logs/gdn_rollout_cost.log` |
 | 3.1 | Engine parity on Qwen3.5-0.8B through the GPTModel-in-vLLM wrapper | **PASS** -- coherent AND 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_gate31_hybrid.log` |
+| T | Trainer builds the real Qwen3.5 hybrid, loads it, fwd+bwd | **PASS** -- 18 GDN + 6 attn; predicts `' Rome'`, prompt CE 1.321 | `/mnt/local_storage/logs/gdn_trainer_model.log` |
 | 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** | -- |
 | 3.3 | Live 5-step DP8 run on Qwen3.5-0.8B | **NOT RUN** | -- |
 
@@ -300,11 +301,48 @@ Seven blockers, each found by running it and fixed in turn:
 
 ---
 
+## The trainer half, on the real model
+
+```
+CUDA_VISIBLE_DEVICES=2 HF_HOME=/mnt/local_storage/hf SKYRL_ZEROKL_GDN=1 SKYRL_ZEROKL_LOCAL_SPEC=1 \
+  uv run --isolated --extra zerokl python examples/zerokl/nightly/gdn_trainer_model_test.py \
+  > /mnt/local_storage/logs/gdn_trainer_model.log 2>&1
+```
+
+```
+1. GPTModel: 18 GatedDeltaNet + 6 attention layers (no transformer_engine)
+2. GDN weights loaded: |dt_bias| mean 5.4707, A_log mean -1.9795, conv1d std 0.0728
+3. forward OK: logits (297, 248320) over 297 tokens (5 chunks of 64)
+   backward OK: random-token CE = 14.989 (ln(vocab) = 12.422); |dW GDN in_proj| = 14.481
+4. 'The capital of France is Paris. ... The capital of Italy is' -> next token ' Rome'; prompt CE = 1.321
+RESULT: PASS
+```
+
+Two assertions here that a bitwise number cannot make: the architecture really is the hybrid (not 24
+dense layers), and the checkpoint really landed in the GDN parameters (`dt_bias` is not the init's
+all-ones, and the model completes `Italy is` with ` Rome`).
+
+---
+
 ## What is NOT done
 
-* **Gate 3.2 (trainer-vs-engine parity on Qwen3.5)** has not been run. The trainer side is validated
-  at layer level (Gate 1) and the engine side end to end (Gate 3.1), but native weight sync between
-  the two has not been exercised on a hybrid model.
+* **Packed (thd) training on a GDN hybrid is untested and probably broken.** With
+  `PackedSeqParams(qkv_format="thd")`, Megatron hands `core_attention` a 3-D `q` of `[T, np, hn]`
+  (the batch dim folded away), while the zero-KL `TorchVarlenCoreAttn` asserts the 4-D sbhd
+  `[sq, b=1, np, hn]` layout:
+
+  ```
+  AssertionError: TorchVarlenCoreAttn supports the b=1 micro-forward (micro_*_batch_size_per_gpu=1)
+  [PROBE] q (297, 8, 256) k (297, 2, 256) v (297, 2, 256)
+  ```
+
+  The trainer-model test above therefore runs UNPACKED. The GDN layers' own packed path is bitwise
+  (Gate 1), so this is confined to `megatron_varlen_attn`. Whether the production trainer actually
+  passes `thd` depends on the data path -- **check this before the 35B run**, because sample packing
+  is the normal SkyRL configuration.
+* **Gate 3.2 (trainer-vs-engine parity on Qwen3.5)** has not been run. Both halves are validated
+  separately (Gate 1 + the trainer-model test; Gate 3.1), but native weight sync between them has not
+  been exercised on a hybrid model.
 * **Gate 3.3 (live 5-step DP8)** has not been run. Gate on
   `policy/rollout_train_logprobs_abs_diff_mean <= 1e-6` at **every** step including 2-5, and
   `policy_kl == 0.0`. A clean step 1 with a dirty step 2 is the sleep/wake weight-clobber class of

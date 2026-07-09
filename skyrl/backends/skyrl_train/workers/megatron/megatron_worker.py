@@ -411,8 +411,18 @@ class MegatronWorker:
         # the idempotent belt-and-braces for anyone who imports megatron.bridge first.
         if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
             from skyrl.backends.skyrl_train.zerokl import install_fla_shim
+            from skyrl.backends.skyrl_train.zerokl.gdn_hybrid_spec import (
+                checkpoint_is_vl_named, patch_qwen35_bridge_for_local_spec,
+            )
 
             install_fla_shim()
+            # Same retarget the engine does (gptmodel_vllm): under the no-TE hybrid spec the GDN
+            # input layernorm is a separate module, not TE's fused `in_proj.layer_norm_weight`, and
+            # the released Qwen3.5 checkpoints store the LM under `model.language_model.`. Without
+            # this the mapping matches nothing and every GDN weight stays at its random init.
+            patch_qwen35_bridge_for_local_spec(
+                hf_lm_prefix="model.language_model." if checkpoint_is_vl_named(hf_config) else None
+            )
 
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
 
