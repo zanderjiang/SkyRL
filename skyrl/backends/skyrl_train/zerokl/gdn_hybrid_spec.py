@@ -112,6 +112,18 @@ _LOCAL_SPEC_RENAMES = {
     "mlp.linear_fc1.layer_norm_weight": "pre_mlp_layernorm.weight",
 }
 
+# The zero-KL MoE recipe pins SequentialMLP (a fixed-order expert combine), whose per-expert params
+# are `mlp.experts.local_experts.<i>.linear_fcX.weight`. The Qwen3.5 MoE bridge only declares the
+# grouped-GEMM names `mlp.experts.linear_fcX.weight<i>`, because its provider assumes grouped GEMM.
+# Nothing matches, and all 256 experts per layer stay at their random init -- silently, exactly the
+# bug `patch_olmoe_bridge_for_sequential_mlp` exists for. Both are per-expert Megatron tensors fed
+# from one fused HF tensor, and `extract_expert_number_from_param` tries `local_experts\.(\d+)`
+# first, so this is a pure rename -- the FusedExpertMapping classes keep working.
+_SEQUENTIAL_MLP_RENAMES = {
+    "mlp.experts.linear_fc1.weight*": "mlp.experts.local_experts.*.linear_fc1.weight",
+    "mlp.experts.linear_fc2.weight*": "mlp.experts.local_experts.*.linear_fc2.weight",
+}
+
 
 _chunked_patched = False
 
@@ -211,9 +223,13 @@ def patch_qwen35_bridge_for_local_spec(*, hf_lm_prefix: str | None = None) -> bo
                 mp = getattr(m, "megatron_param", None)
                 if not mp:
                     continue
-                for te_name, local_name in _LOCAL_SPEC_RENAMES.items():
-                    if mp.endswith(te_name):
-                        m.megatron_param = mp[: -len(te_name)] + local_name
+                for old, new in (*_LOCAL_SPEC_RENAMES.items(), *_SEQUENTIAL_MLP_RENAMES.items()):
+                    if mp.endswith(old):
+                        m.megatron_param = mp[: -len(old)] + new
+                        # __init__ validated the original pattern; re-check ours (the wildcard count
+                        # must still line up with hf_param, or resolution silently mispairs captures).
+                        if hasattr(m, "_validate_patterns"):
+                            m._validate_patterns()
                         break
             return mappings
 
