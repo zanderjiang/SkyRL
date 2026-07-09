@@ -766,7 +766,13 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
                     # MoE: set to 0 to A/B the unpatched (batch-variant) expert combine + router
                     # top-k. Read in zerokl/moe_batch_invariant.py inside BOTH the trainer worker
                     # and the vLLM engine actor -> must be forwarded to reach either.
-                    "SKYRL_ZEROKL_MOE_DETERMINISTIC"):
+                    "SKYRL_ZEROKL_MOE_DETERMINISTIC",
+                    # GatedDeltaNet (Qwen3.5 hybrid): SKYRL_ZEROKL_GDN=1 installs the `fla` shim in
+                    # the trainer AND the chunk-consistent decode patch in the engine; PIN_CONFIGS /
+                    # CONFIG_INDEX select the Triton autotune config (must be identical on both
+                    # sides); EAGER_PREP keeps megatron's g/beta + qkv-prep out of torch.compile.
+                    "SKYRL_ZEROKL_GDN", "SKYRL_ZEROKL_GDN_PIN_CONFIGS", "SKYRL_ZEROKL_GDN_CONFIG_INDEX",
+                    "SKYRL_ZEROKL_GDN_EAGER_PREP"):
             if os.environ.get(_zk):
                 env_vars[_zk] = os.environ[_zk]
 

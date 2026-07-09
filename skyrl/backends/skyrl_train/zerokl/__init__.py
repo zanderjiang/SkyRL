@@ -26,6 +26,13 @@ from .no_te_guard import install_no_te_guard
 
 install_no_te_guard()
 
+# GatedDeltaNet (Qwen3.5 hybrid): register the `fla` facade BEFORE anything imports
+# megatron.core.ssm.gated_delta_net, which binds `chunk_gated_delta_rule` at import time and raises
+# from GatedDeltaNet.__init__ when the import failed. No-op unless SKYRL_ZEROKL_GDN=1.
+from .gdn_fla_shim import install_fla_shim  # noqa: E402
+
+install_fla_shim()
+
 from .megatron_patches import (
     apply_megatron_zerokl_patches,
     revert_megatron_zerokl_patches,
@@ -52,6 +59,7 @@ from .vllm_patches import (
 )
 
 __all__ = [
+    "install_fla_shim",
     "enable_moe_deterministic_ops",
     "force_zerokl_moe_config",
     "make_zerokl_local_layer_spec",

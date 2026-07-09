@@ -95,11 +95,196 @@ def gdn_causal_conv(
     return y, final_state
 
 
+L2NORM_EPS = 1e-6
+
+
+class _GdnL2NormAutograd(torch.autograd.Function):
+    """vLLM's ``l2norm_fwd`` in the forward, autograd of the same expression in the backward.
+
+    ``l2norm_fwd`` is a bare Triton launch writing into ``torch.empty_like(x)``: the result carries
+    no autograd history, so backprop through it would silently deliver ZERO gradient to q and k --
+    the layer would still train (v flows) and the loss would still fall, which is exactly why this is
+    worth a class. Forward keeps the kernel (bitwise with the engine); backward differentiates
+    ``x * rsqrt(sum(x^2) + eps)``, the expression the kernel evaluates.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
+
+        with torch.no_grad():
+            y = l2norm_fwd(x)
+        ctx.save_for_backward(x)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        (x,) = ctx.saved_tensors
+        with torch.enable_grad():
+            xd = x.detach().float().requires_grad_(True)
+            y = xd * torch.rsqrt(xd.pow(2).sum(-1, keepdim=True) + L2NORM_EPS)
+            (dx,) = torch.autograd.grad(y, xd, dy.float())
+        return dx.to(x.dtype)
+
+
 def gdn_l2norm(x: torch.Tensor) -> torch.Tensor:
     """Row-local L2 normalisation, via the same kernel the engine and trainer both import."""
     from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 
+    if torch.is_grad_enabled() and x.requires_grad:
+        return _GdnL2NormAutograd.apply(x)
     return l2norm_fwd(x)
+
+
+def fla_chunk_size() -> int:
+    from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+
+    return FLA_CHUNK_SIZE
+
+
+def _gdn_chunk_fwd(q, k, v, g, beta, initial_state, output_final_state, cu_seqlens):
+    """The bitwise forward: vLLM's vendored FLA chunk kernel with pinned autotune configs."""
+    from vllm.model_executor.layers.fla.ops.chunk import chunk_gated_delta_rule
+    from vllm.model_executor.layers.fla.ops.index import (
+        prepare_chunk_indices,
+        prepare_chunk_offsets,
+    )
+    from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+
+    from .gdn_batch_invariant import pin_fla_autotune_configs
+
+    pin_fla_autotune_configs()  # idempotent; must be in effect before the first launch
+
+    chunk_indices = chunk_offsets = None
+    if cu_seqlens is not None:
+        # `prepare_chunk_indices` is `@tensor_cache`d on tensor IDENTITY, and vLLM recycles its
+        # metadata buffers. Feeding it the caller's tensor can hand back a chunk map built for a
+        # previous batch's cu_seqlens. A fresh clone forces a real recompute every call.
+        cu_fresh = cu_seqlens.clone()
+        chunk_indices = prepare_chunk_indices(cu_fresh, FLA_CHUNK_SIZE)
+        chunk_offsets = prepare_chunk_offsets(cu_fresh, FLA_CHUNK_SIZE)
+
+    return chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        use_qk_l2norm_in_kernel=False,  # done outside, identically on both sides
+    )
+
+
+def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
+    """Differentiable fp32 chunked delta rule for ONE sequence. q..beta: ``[1, T, H, D]``.
+
+    This is the HuggingFace / megatron ``torch_chunk_gated_delta_rule`` reference, unchanged except
+    that it takes ``initial_state`` in the kernel's ``[N, H, V, K]`` layout. It exists only to supply
+    a vector-Jacobian product (see :class:`_GdnChunkAutograd`); it never runs in the forward.
+    """
+    q, k, v, beta, g = (x.transpose(1, 2).contiguous().float() for x in (q, k, v, beta, g))
+    _, num_heads, T, k_dim = k.shape
+    v_dim = v.shape[-1]
+
+    pad = (chunk_size - T % chunk_size) % chunk_size
+    q, k, v = (torch.nn.functional.pad(x, (0, 0, 0, pad)) for x in (q, k, v))
+    beta, g = (torch.nn.functional.pad(x, (0, pad)) for x in (beta, g))
+    Tp = T + pad
+    q = q * (k_dim**-0.5)
+
+    v_beta = v * beta.unsqueeze(-1)
+    k_beta = k * beta.unsqueeze(-1)
+    q, k, v, k_beta, v_beta = (
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (q, k, v, k_beta, v_beta)
+    )
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+
+    eye_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), 0)
+    g = g.cumsum(dim=-1)
+    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()
+    attn = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(eye_mask, 0)
+    for i in range(1, chunk_size):  # forward substitution -> (I - A)^-1, strictly lower triangular
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn = attn.clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+
+    u = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    if initial_state is None:
+        state = q.new_zeros(1, num_heads, k_dim, v_dim)
+    else:
+        state = initial_state.transpose(-1, -2).float()  # [N,H,V,K] -> [N,H,K,V]
+
+    strict_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), 1)
+    outs = []
+    for i in range(Tp // chunk_size):
+        q_i, k_i = q[:, :, i], k[:, :, i]
+        a = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill(strict_mask, 0)
+        v_new = u[:, :, i] - k_cumdecay[:, :, i] @ state
+        outs.append((q_i * g[:, :, i, :, None].exp()) @ state + a @ v_new)
+        state = state * g[:, :, i, -1, None, None].exp() + (
+            k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]
+        ).transpose(-1, -2) @ v_new
+
+    o = torch.stack(outs, dim=2).reshape(1, num_heads, Tp, v_dim)[:, :, :T]
+    return o.transpose(1, 2)  # [1, T, H, V]
+
+
+def _torch_chunk_gdr(q, k, v, g, beta, initial_state, cu_seqlens, chunk_size):
+    if cu_seqlens is None:
+        return _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size)
+    bounds = cu_seqlens.tolist()
+    outs = []
+    for n, (s, e) in enumerate(zip(bounds[:-1], bounds[1:])):
+        s0 = None if initial_state is None else initial_state[n : n + 1]
+        outs.append(
+            _torch_chunk_gdr_one(
+                q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e], s0, chunk_size
+            )
+        )
+    return torch.cat(outs, dim=1)
+
+
+class _GdnChunkAutograd(torch.autograd.Function):
+    """Bitwise kernel forward + reference VJP backward.
+
+    vLLM vendors FLA's chunk kernel for *inference*: ``ChunkGatedDeltaRuleFunction`` defines a
+    ``forward`` and no ``backward``, so autograd raises the moment the trainer tries to backprop
+    through it. We still want that exact kernel in the forward -- it is the whole reason decode and
+    training agree bitwise -- so the forward stays untouched and the backward re-derives the
+    gradient by differentiating :func:`_torch_chunk_gdr`, the fp32 torch reference for the same
+    function, at the same inputs.
+
+    That gradient is not bitwise equal to the kernel's analytic gradient (nobody's is; the kernel has
+    none), and it does not need to be: zero-KL constrains the FORWARD logprobs, which set the
+    importance ratio. The gradient only has to be the gradient of that forward, to fp accuracy.
+    Megatron makes the same trade in ``deterministic_mode``, where the forward itself changes.
+
+    COST: backward recomputes the layer in fp32 with a ``chunk_size``-long python loop. It is the
+    slowest part of a GDN training step. If that becomes the bottleneck, the fix is a real fused
+    backward, not a different forward.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, initial_state, cu_seqlens, chunk_size):
+        with torch.no_grad():
+            o, _ = _gdn_chunk_fwd(q, k, v, g, beta, initial_state, False, cu_seqlens)
+        ctx.save_for_backward(q, k, v, g, beta, initial_state)
+        ctx.cu_seqlens = cu_seqlens
+        ctx.chunk_size = chunk_size
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, g, beta, initial_state = ctx.saved_tensors
+        with torch.enable_grad():
+            leaves = [t.detach().requires_grad_(True) for t in (q, k, v, g, beta)]
+            o = _torch_chunk_gdr(*leaves, initial_state, ctx.cu_seqlens, ctx.chunk_size)
+            grads = torch.autograd.grad(o, leaves, do.float())
+        grads = [gr.to(t.dtype) for gr, t in zip(grads, (q, k, v, g, beta))]
+        return (*grads, None, None, None)
 
 
 def gdn_chunk(
@@ -118,32 +303,24 @@ def gdn_chunk(
     Returns ``(o, final_state)``. ``final_state`` is meaningful only when the trailing chunk of each
     sequence is FULL -- for a partial chunk it is the state after that partial chunk, which is not a
     point on the chunk grid.
+
+    Under ``torch.no_grad`` (both rollout paths and the trainer's scoring forward) this is exactly
+    the vLLM kernel. When a gradient is required it routes through :class:`_GdnChunkAutograd`, whose
+    forward is that same kernel -- so the training forward stays bitwise equal to the rollout.
     """
-    from vllm.model_executor.layers.fla.ops.chunk import chunk_gated_delta_rule
-    from vllm.model_executor.layers.fla.ops.index import (
-        prepare_chunk_indices,
-        prepare_chunk_offsets,
+    needs_grad = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
     )
-    from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+    if not needs_grad:
+        return _gdn_chunk_fwd(q, k, v, g, beta, initial_state, output_final_state, cu_seqlens)
 
-    from .gdn_batch_invariant import pin_fla_autotune_configs
-
-    pin_fla_autotune_configs()  # idempotent; must be in effect before the first launch
-
-    chunk_indices = chunk_offsets = None
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, FLA_CHUNK_SIZE)
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, FLA_CHUNK_SIZE)
-
-    return chunk_gated_delta_rule(
-        q=q, k=k, v=v, g=g, beta=beta,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        use_qk_l2norm_in_kernel=False,  # done outside, identically on both sides
-    )
+    if output_final_state:
+        raise NotImplementedError(
+            "zerokl GDN: output_final_state is not differentiable (training never asks for it; "
+            "only chunk-consistent decode does, under no_grad)."
+        )
+    o = _GdnChunkAutograd.apply(q, k, v, g, beta, initial_state, cu_seqlens, fla_chunk_size())
+    return o, None
 
 
 def gdn_gate_and_beta(
@@ -155,7 +332,10 @@ def gdn_gate_and_beta(
     """g = -exp(A_log) * softplus(a + dt_bias) in fp32; beta = sigmoid(b). Elementwise -> invariant.
 
     Mirrors megatron ``GatedDeltaNet._compute_g_and_beta`` exactly (fp32 g, beta in the input dtype).
+    ``A_log.exp()`` is taken in the parameter's own dtype, not upcast first: megatron stores A_log in
+    ``params_dtype`` (bf16) and exponentiates before the fp32 multiply, and ``exp(bf16(x)).float()``
+    is not ``exp(float(x))``. Zero-KL lives in that last ulp.
     """
-    g = -torch.exp(A_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float())
+    g = -A_log.exp() * torch.nn.functional.softplus(a.float() + dt_bias.float())
     beta = b.sigmoid()
     return g, beta

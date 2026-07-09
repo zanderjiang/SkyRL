@@ -404,6 +404,16 @@ class MegatronWorker:
 
             patch_olmoe_bridge_for_sequential_mlp()
 
+        # SkyRL-ZeroKL: Qwen3.5's GatedDeltaNet layers need the `fla` facade (zerokl.gdn_fla_shim)
+        # or GatedDeltaNet.__init__ raises ImportError. The authoritative install happens at
+        # `import skyrl.backends.skyrl_train.zerokl` (line ~18, before `from megatron.bridge import
+        # AutoBridge`), because megatron binds chunk_gated_delta_rule at import time. This call is
+        # the idempotent belt-and-braces for anyone who imports megatron.bridge first.
+        if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+            from skyrl.backends.skyrl_train.zerokl import install_fla_shim
+
+            install_fla_shim()
+
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
 
         # For Qwen3.5, language_model_only routes to the native GPTModel + GDN

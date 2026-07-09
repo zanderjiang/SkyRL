@@ -193,6 +193,13 @@ class GPTModelVLLMWrapper(nn.Module):
         # SequentialMLP pin, OLMoE's grouped-GEMM-only expert mappings would match nothing.
         if os.environ.get("SKYRL_ZEROKL_LOCAL_SPEC") == "1":
             patch_olmoe_bridge_for_sequential_mlp()
+        # Same `fla` facade the trainer installs: the engine builds the SAME GPTModel, so its GDN
+        # layers must run the same ops. Idempotent -- normally already done by the zerokl package
+        # __init__, which runs before this module's body.
+        if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+            from skyrl.backends.skyrl_train.zerokl import install_fla_shim
+
+            install_fla_shim()
         b = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
         mp = b.to_megatron_provider(load_weights=load_weights)
         mp.tensor_model_parallel_size = 1
