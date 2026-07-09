@@ -15,7 +15,8 @@ Typical wiring:
         from skyrl.backends.skyrl_train.zerokl import apply_megatron_zerokl_patches
         apply_megatron_zerokl_patches()
 
-Scope: Qwen3 dense. MoE / hybrid / MLA extension points are marked ``# EXTEND:``.
+Scope: Qwen3 dense + Megatron MoE at TP=PP=EP=1 (see ``moe_batch_invariant.py``). Hybrid /
+linear-attention (GatedDeltaNet) and MLA extension points are marked ``# EXTEND:``.
 """
 
 # Install the no-TransformerEngine import guard FIRST -- before anything that may import
@@ -34,6 +35,15 @@ from .megatron_patches import (
     scoring_mode,
     zerokl_patch_status,
 )
+from .moe_batch_invariant import (
+    enable_moe_deterministic_ops,
+    force_zerokl_moe_config,
+    make_zerokl_local_layer_spec,
+    patch_olmoe_bridge_for_sequential_mlp,
+    prepare_zerokl_moe,
+    provider_is_moe,
+    revert_moe_deterministic_ops,
+)
 from .vllm_patches import (
     apply_vllm_zerokl_env,
     zerokl_engine_arg_overrides,
@@ -42,6 +52,13 @@ from .vllm_patches import (
 )
 
 __all__ = [
+    "enable_moe_deterministic_ops",
+    "force_zerokl_moe_config",
+    "make_zerokl_local_layer_spec",
+    "patch_olmoe_bridge_for_sequential_mlp",
+    "prepare_zerokl_moe",
+    "provider_is_moe",
+    "revert_moe_deterministic_ops",
     "apply_megatron_zerokl_patches",
     "revert_megatron_zerokl_patches",
     "enable_megatron_batch_invariant",
