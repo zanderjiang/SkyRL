@@ -139,6 +139,47 @@ def pin_fla_autotune_configs() -> int:
     return len(pinned)
 
 
+_norm_pinned = False
+
+
+def pin_gdn_rmsnorm_rows_per_block() -> bool:
+    """Make ``RMSNormGated`` (the GDN output norm) batch-invariant. Idempotent.
+
+    ``fla.ops.layernorm_guard.layer_norm_fwd`` picks its Triton tile height from the ROW COUNT::
+
+        rows_per_block = min(next_power_of_2(cdiv(M, 2 * sm_count)), 4)
+
+    and the kernel then reduces a ``[ROWS_PER_BLOCK, BLOCK_N]`` tile with ``tl.sum(x, axis=1)``. The
+    tile shape decides how the 128 elements of a row are spread across threads, hence the order of
+    the fp32 reduction, hence the last bit of ``rstd``. On H100 (132 SMs) a GDN decode step has
+    M = num_tokens * num_v_heads = 16 -> rows_per_block 1, while the prefill that rescores the same
+    tokens has M = 3472 -> rows_per_block 4. Same input row, different bits, occasionally.
+
+    This is the last non-invariant op on the Qwen3.5 GDN path once decode is chunk-consistent:
+    measured as decoder layer 0's output diverging at 2.4e-4 while its GDN core (``_forward_core``)
+    was bitwise on both its input and its output (examples/zerokl/nightly/gdn_engine_core_probe.py).
+
+    Pin the tile height to a constant so the reduction order cannot depend on the batch. The cost is
+    a taller grid at prefill; the kernel is memory-bound and this is not the layer's hot path.
+    """
+    global _norm_pinned
+
+    if _norm_pinned:
+        return True
+    rows = int(os.environ.get("SKYRL_ZEROKL_GDN_NORM_ROWS", "1"))
+    try:
+        from vllm.model_executor.layers.fla.ops import layernorm_guard as lg
+    except Exception as e:  # pragma: no cover
+        logger.warning("[zerokl-gdn] cannot pin RMSNormGated tile height: %s", e)
+        return False
+
+    lg.calc_rows_per_block = lambda M, device, _r=rows: _r
+    _norm_pinned = True
+    print(f"[ZEROKL-GDN] pinned RMSNormGated tile height to {rows} row(s) -> batch-invariant "
+          "gated norm (was M-dependent: 1 row at decode, 4 at prefill)", flush=True)
+    return True
+
+
 # --------------------------------------------------------------------------------------
 # verification -- the three properties zero-KL rests on. Cheap; run it in tests and CI.
 # --------------------------------------------------------------------------------------

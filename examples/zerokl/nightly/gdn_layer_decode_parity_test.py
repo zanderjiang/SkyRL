@@ -45,7 +45,7 @@ def build(num_slots, dev):
     qkv_dim = 2 * NUM_K_HEADS * HEAD_K + NUM_V_HEADS * HEAD_V
     torch.manual_seed(1234)
     return ChunkConsistentGDN(
-        num_slots=num_slots,
+        capacity=num_slots,
         chunk_size=CHUNK,
         conv_weight=torch.randn(qkv_dim, W, dtype=DTYPE, device=dev) * 0.1,
         conv_bias=torch.randn(qkv_dim, dtype=DTYPE, device=dev) * 0.1,

@@ -40,12 +40,22 @@ COST. The open chunk holds 1..C tokens (mean (C+1)/2), so a decoded token costs 
 GDN work instead of 1 -- on the GDN layers only, which are cheap linear attention. C is
 ``FLA_CHUNK_SIZE`` and trades decode cost against training-kernel efficiency.
 
+MEMORY. Each concurrently-running request needs ``C x qkv_dim`` bf16 of open-chunk buffer per GDN
+layer (786 KiB at C=64, qkv_dim=6144). Buffers are therefore sized by the scheduler's
+``max_num_seqs``, NOT by the engine's ssm-state slot count -- vLLM allocates thousands of state slots
+out of leftover KV memory, and one buffer per slot would be tens of GiB. A small LRU maps live slot
+ids onto buffers; the mapping is only ever established by ``prefill``, which is also the only way a
+request (re)enters a slot, so an eviction can only ever hit a slot whose request is gone. ``decode``
+raises rather than guess if a slot has no buffer.
+
 This module is engine-agnostic on purpose: :class:`ChunkConsistentGDN` owns the buffers and the
 math, and is tested offline (``examples/zerokl/nightly/gdn_layer_decode_parity_test.py``) without
 booting vLLM. The vLLM wiring lives separately.
 """
 
 from __future__ import annotations
+
+from collections import OrderedDict
 
 import torch
 
@@ -55,13 +65,14 @@ from .gdn_ops import gdn_causal_conv, gdn_chunk, gdn_gate_and_beta, gdn_l2norm
 class ChunkConsistentGDN:
     """Per-layer open-chunk state for one GDN layer, shared by prefill and decode.
 
-    Slots mirror the engine's ssm-state slots (one per running request).
+    ``capacity`` buffers back at most that many concurrently-running requests; engine slot ids are
+    mapped onto them on ``prefill``.
     """
 
     def __init__(
         self,
         *,
-        num_slots: int,
+        capacity: int,
         chunk_size: int,
         conv_weight: torch.Tensor,   # [D_qkv, W]
         conv_bias: torch.Tensor | None,
@@ -90,17 +101,48 @@ class ChunkConsistentGDN:
 
         W = conv_weight.shape[-1]
         self.qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        self.capacity = capacity
         dev = device
 
         # open-chunk ring: pre-conv inputs of the tokens since the last chunk boundary
-        self.x_buf = torch.zeros(num_slots, chunk_size, self.qkv_dim, dtype=dtype, device=dev)
-        self.a_buf = torch.zeros(num_slots, chunk_size, num_v_heads, dtype=dtype, device=dev)
-        self.b_buf = torch.zeros(num_slots, chunk_size, num_v_heads, dtype=dtype, device=dev)
-        self.fill = torch.zeros(num_slots, dtype=torch.int32, device=dev)
+        self.x_buf = torch.zeros(capacity, chunk_size, self.qkv_dim, dtype=dtype, device=dev)
+        self.a_buf = torch.zeros(capacity, chunk_size, num_v_heads, dtype=dtype, device=dev)
+        self.b_buf = torch.zeros(capacity, chunk_size, num_v_heads, dtype=dtype, device=dev)
+        self.fill = torch.zeros(capacity, dtype=torch.int32, device=dev)
         # state AT the last chunk boundary (not at the last token)
-        self.conv_state0 = torch.zeros(num_slots, self.qkv_dim, W - 1, dtype=dtype, device=dev)
-        self.ssm_state0 = torch.zeros(num_slots, num_v_heads, head_v_dim, head_k_dim,
+        self.conv_state0 = torch.zeros(capacity, self.qkv_dim, W - 1, dtype=dtype, device=dev)
+        self.ssm_state0 = torch.zeros(capacity, num_v_heads, head_v_dim, head_k_dim,
                                       dtype=torch.float32, device=dev)
+
+        # engine slot id -> buffer row, most-recently-used last
+        self._slot2buf: OrderedDict[int, int] = OrderedDict()
+        self._free: list[int] = list(range(capacity))
+
+    # -- slot <-> buffer mapping ---------------------------------------------------------
+    def _assign(self, slot: int) -> int:
+        """Buffer row for a slot that is starting a fresh prefill. Evicts an LRU slot if needed."""
+        buf = self._slot2buf.pop(slot, None)
+        if buf is None:
+            if not self._free:
+                # Every live request touched its slot this step, so the LRU entry belongs to a
+                # request that has finished (or was preempted -- vLLM re-prefills those).
+                _dead, buf = self._slot2buf.popitem(last=False)
+            else:
+                buf = self._free.pop()
+        self._slot2buf[slot] = buf
+        return buf
+
+    def _lookup(self, slot: int) -> int:
+        """Buffer row for a decoding slot. Must already exist -- decode never starts a sequence."""
+        buf = self._slot2buf.pop(slot, None)
+        if buf is None:
+            raise RuntimeError(
+                f"[zerokl-gdn] slot {slot} is decoding but has no open-chunk buffer. Either its "
+                f"prefill never went through ChunkConsistentGDN, or more than capacity={self.capacity} "
+                "requests are live at once (capacity must be >= the scheduler's max_num_seqs)."
+            )
+        self._slot2buf[slot] = buf  # touch: most recently used
+        return buf
 
     # -- helpers ------------------------------------------------------------------------
     def _split_qkv(self, y: torch.Tensor):
@@ -140,6 +182,7 @@ class ChunkConsistentGDN:
         P = x.shape[0]
         C = self.C
         B = (P // C) * C
+        s = self._assign(slot)
 
         q, k, v, g, beta, conv_after_all = self._prep(x, a, b, None)
 
@@ -148,26 +191,26 @@ class ChunkConsistentGDN:
             o_head, s_b = gdn_chunk(q[None, :B], k[None, :B], v[None, :B], g[None, :B], beta[None, :B],
                                     initial_state=None, output_final_state=True)
             outs.append(o_head[0])
-            self.ssm_state0[slot] = s_b[0].float()
+            self.ssm_state0[s] = s_b[0].float()
             # conv state at the boundary = last W-1 pre-conv inputs before B
             _, conv_at_B = gdn_causal_conv(x[:B], self.conv_weight, self.conv_bias,
                                            activation=self.activation, return_final_state=True)
-            self.conv_state0[slot] = conv_at_B
+            self.conv_state0[s] = conv_at_B
         else:
-            self.ssm_state0[slot].zero_()
-            self.conv_state0[slot].zero_()
+            self.ssm_state0[s].zero_()
+            self.conv_state0[s].zero_()
 
         if P > B:
             o_tail, _ = gdn_chunk(q[None, B:], k[None, B:], v[None, B:], g[None, B:], beta[None, B:],
-                                  initial_state=self.ssm_state0[slot : slot + 1], output_final_state=False)
+                                  initial_state=self.ssm_state0[s : s + 1], output_final_state=False)
             outs.append(o_tail[0])
 
         fill = P - B
-        self.fill[slot] = fill
+        self.fill[s] = fill
         if fill:
-            self.x_buf[slot, :fill] = x[B:]
-            self.a_buf[slot, :fill] = a[B:]
-            self.b_buf[slot, :fill] = b[B:]
+            self.x_buf[s, :fill] = x[B:]
+            self.a_buf[s, :fill] = a[B:]
+            self.b_buf[s, :fill] = b[B:]
         return torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
 
     @torch.no_grad()
@@ -178,23 +221,24 @@ class ChunkConsistentGDN:
         cross-sequence invariant (pinned configs), so each request's row is bitwise what it would be
         alone.
         """
-        slots = slots.to(torch.long)
         N = slots.numel()
         C = self.C
+        bufs = torch.tensor([self._lookup(int(s)) for s in slots.tolist()],
+                            dtype=torch.long, device=self.fill.device)
 
         # append the new token to each open chunk
-        fills = self.fill[slots].to(torch.long)
+        fills = self.fill[bufs].to(torch.long)
         if (fills >= C).any():
             raise RuntimeError("open chunk should have been rolled before decode()")
-        self.x_buf[slots, fills] = x
-        self.a_buf[slots, fills] = a
-        self.b_buf[slots, fills] = b
+        self.x_buf[bufs, fills] = x
+        self.a_buf[bufs, fills] = a
+        self.b_buf[bufs, fills] = b
         fills = fills + 1
-        self.fill[slots] = fills.to(torch.int32)
+        self.fill[bufs] = fills.to(torch.int32)
 
         qs, ks, vs, gs, bs, lens = [], [], [], [], [], []
         for i in range(N):
-            s = int(slots[i])
+            s = int(bufs[i])
             n = int(fills[i])
             q, k, v, g, beta, _ = self._prep(
                 self.x_buf[s, :n], self.a_buf[s, :n], self.b_buf[s, :n], self.conv_state0[s]
@@ -206,7 +250,7 @@ class ChunkConsistentGDN:
         need_state = any(n == C for n in lens)
         o, final_state = gdn_chunk(
             cat(qs), cat(ks), cat(vs), cat(gs), cat(bs),
-            initial_state=self.ssm_state0[slots], output_final_state=need_state, cu_seqlens=cu,
+            initial_state=self.ssm_state0[bufs], output_final_state=need_state, cu_seqlens=cu,
         )
 
         out = torch.stack([o[0, int(cu[i + 1]) - 1] for i in range(N)], dim=0)
@@ -215,7 +259,7 @@ class ChunkConsistentGDN:
         for i in range(N):
             if lens[i] != C:
                 continue
-            s = int(slots[i])
+            s = int(bufs[i])
             self.ssm_state0[s] = final_state[i].float()
             _, conv_at_B = gdn_causal_conv(
                 self.x_buf[s, :C], self.conv_weight, self.conv_bias,

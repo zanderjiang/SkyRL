@@ -1,8 +1,13 @@
-"""Measure decode-vs-prefill logprob divergence of Qwen3.5's GatedDeltaNet layers. MEASUREMENT ONLY.
+"""Decode-vs-prefill logprob divergence of Qwen3.5's GatedDeltaNet layers: the baseline, and GATE 2.
 
 Phase 2. Plain native vLLM -- NOT the zero-KL GPTModel wrapper, no Megatron, no Ray, one GPU. The
 point is to quantify how far a linear-attention (GatedDeltaNet) model sits from decode == prefill
-parity, so the separate GDN workstream knows what it is chasing. Nothing here is a fix.
+parity, so the separate GDN workstream knows what it is chasing.
+
+Two modes:
+  * ``SKYRL_ZEROKL_GDN`` unset -- the BASELINE measurement. Nothing here is a fix.
+  * ``SKYRL_ZEROKL_GDN=1``    -- GATE 2. Installs ``zerokl.gdn_engine_patch``, which routes GDN
+    prefill AND decode through the training chunk kernel. Expect exact-0.0 on 100% of tokens.
 
 Method: generate N sequences of L tokens at temperature 1.0 with per-token logprobs, then feed each
 completed sequence back through the *same* engine as a prompt and read ``prompt_logprobs`` for the
@@ -52,24 +57,73 @@ def percentile(sorted_vals, q):
 
 
 def run_one(batch_invariant: bool):
+    patched = os.environ.get("SKYRL_ZEROKL_GDN") == "1"
+    if patched:
+        # The monkey-patch lives in THIS process's class object. vLLM v1 runs the model in an
+        # EngineCore subprocess by default, which imports its own copy and would silently ignore us
+        # (the symptom is a "patched" run whose numbers equal the baseline exactly). Same in-process
+        # requirement the rest of the zero-KL stack has -- see vllm_engine.setup_envvars_for_vllm.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # Chunk-consistent GDN lifts vLLM's "batch_invariant not supported for GDN_ATTN" veto, so the
+        # rest of the model (softmax attention, GEMMs, log_softmax) can finally be made invariant
+        # too. Without this the non-GDN layers carry their own ~1e-2 decode-vs-prefill gap.
+        os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+
     import vllm.envs as vllm_envs
     from vllm import LLM, SamplingParams
 
+    if patched:
+        sys.path.insert(0, "/home/ray/default/SkyRL-ZeroKL")
+        from skyrl.backends.skyrl_train.zerokl.gdn_engine_patch import install_gdn_engine_patch
+        from skyrl.backends.skyrl_train.zerokl.moe_batch_invariant import (
+            _install_moe_matmul_invariance,
+        )
+        from skyrl.backends.skyrl_train.zerokl.varlen_backend import (
+            register_varlen_custom_backend,
+        )
+        from skyrl.backends.skyrl_train.zerokl.vllm_patches import (
+            patch_vllm_logprobs_batch_invariant,
+        )
+
+        install_gdn_engine_patch()
+        # Chunk-consistent decode makes the 24 GDN layers decode==prefill (gdn_engine_layer_bisect:
+        # max |diff| 0.0). The model's OTHER 8 layers are softmax attention, and VLLM_BATCH_INVARIANT
+        # does NOT unify their decode/prefill kernels -- that is what the zero-KL CUSTOM varlen
+        # backend (num_splits=1, FA3) exists for. Without it they contribute their own ~1e-2 gap and
+        # Gate 2 measures the wrong thing.
+        register_varlen_custom_backend()
+        # SM90: vLLM's batch-invariant mode does not install the Triton matmuls (cuBLAS is only
+        # split-K-pinned, not M-invariant). The in/out projections run at M=num_decode_tokens vs
+        # M=prefill_tokens, so pin them to the Triton batch-invariant GEMMs -- same override the MoE
+        # path uses (that is where this bug was first measured, 4.3e-5 row drift at fp32).
+        _install_moe_matmul_invariance()
+        # vLLM's fused-Triton sampler logprob kernel never calls aten log_softmax. Same patch the
+        # dense/MoE zero-KL stack already uses.
+        patch_vllm_logprobs_batch_invariant()
+
     print(
         f"=== GDN decode-vs-prefill | model={MODEL} nseq={NSEQ} ntok={NTOK} "
-        f"VLLM_BATCH_INVARIANT={vllm_envs.VLLM_BATCH_INVARIANT} ===",
+        f"VLLM_BATCH_INVARIANT={vllm_envs.VLLM_BATCH_INVARIANT} "
+        f"chunk_consistent_decode={patched} ===",
         flush=True,
     )
     llm = LLM(
         model=MODEL,
         dtype="bfloat16",
         enforce_eager=True,
-        gpu_memory_utilization=0.80,
+        # Chunk-consistent decode allocates C x qkv_dim of open-chunk buffer per running request per
+        # GDN layer, AFTER vLLM has claimed gpu_memory_utilization for KV. Cap concurrency at the
+        # number of sequences we actually run, and leave headroom.
+        max_num_seqs=NSEQ,
+        gpu_memory_utilization=0.55 if patched else 0.80,
         max_model_len=NTOK + 512,
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
         trust_remote_code=True,
         seed=0,
+        # The zero-KL varlen backend (num_splits=1 + FA3) for the softmax-attention layers; the GDN
+        # layers use their own (mamba-typed) backend and are unaffected by this selector.
+        **({"attention_backend": "CUSTOM"} if patched else {}),
         # Text-only measurement: Qwen3_5ForConditionalGeneration registers as multimodal, and
         # vLLM's startup profiling would otherwise run the vision processor on a dummy image
         # (which also needs torchvision, absent from the zerokl env).
@@ -112,13 +166,17 @@ def run_one(batch_invariant: bool):
 
     srt = sorted(all_diffs)
     exact0 = sum(1 for d in all_diffs if d == 0.0)
+    # `max(0.0, nan) == 0.0` in python, so a NaN would be reported as "exact, max 0.0". Count NaNs.
+    nans = sum(1 for d in all_diffs if d != d)
+    worst = max((d for d in all_diffs if d == d), default=0.0)
     print(
         f"\ntokens compared : {len(all_diffs)}\n"
         f"exact 0.0       : {exact0}/{len(all_diffs)} ({100.0 * exact0 / len(all_diffs):.2f}%)\n"
+        f"NaN diffs       : {nans}\n"
         f"mean |diff|     : {statistics.fmean(all_diffs):.6e}\n"
         f"P50 |diff|      : {percentile(srt, 0.50):.6e}\n"
         f"P99 |diff|      : {percentile(srt, 0.99):.6e}\n"
-        f"max |diff|      : {srt[-1]:.6e}",
+        f"max |diff|      : {worst:.6e}",
         flush=True,
     )
 
@@ -132,6 +190,20 @@ def run_one(batch_invariant: bool):
                 f"mean={statistics.fmean(vals):.6e}  max={max(vals):.6e}  n={len(vals)}",
                 flush=True,
             )
+
+    if patched:
+        from skyrl.backends.skyrl_train.zerokl.gdn_engine_patch import forward_core_call_count
+
+        calls = forward_core_call_count()
+        if calls == 0:
+            raise SystemExit("GATE 2 INVALID: the patched _forward_core never ran in this process "
+                             "(vLLM used an EngineCore subprocess?). The numbers below are the baseline.")
+        ok = exact0 == len(all_diffs) and nans == 0
+        print(f"\npatched _forward_core calls: {calls}")
+        print(f"RESULT: GATE 2 {'PASS' if ok else 'FAIL'} -- "
+              f"{exact0}/{len(all_diffs)} tokens bitwise, max {worst:.6e}, {nans} NaN", flush=True)
+        if not ok:
+            raise SystemExit(1)
 
 
 def main():

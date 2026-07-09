@@ -171,6 +171,22 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
             # a few tokens. Route the generator through aten log_softmax (== trainer) for bitwise
             # rollout==train. In-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) so this reaches the sampler.
             patch_vllm_logprobs_batch_invariant()
+        # GatedDeltaNet (Qwen3.5 hybrid): 3 of every 4 layers are linear attention, whose decode
+        # kernel disagrees with its own prefill kernel by ~1.7e-2 in logprob. Route both phases
+        # through the training chunk kernel (chunk-consistent decode). This redefines ssm_state as a
+        # chunk-BOUNDARY state, so prefix caching / chunked prefill / spec decode / CUDA graphs must
+        # be off -- assert that rather than degrade quietly. (Those three are bitwise-safe for the
+        # softmax layers and worth 4.6x rollout; GDN support for them is a follow-up.)
+        if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+            from skyrl.backends.skyrl_train.zerokl.gdn_engine_patch import (
+                assert_engine_args_compatible, install_gdn_engine_patch)
+
+            for _k in ("enable_prefix_caching", "enable_chunked_prefill"):
+                kwargs[_k] = False
+            kwargs["enforce_eager"] = True
+            assert_engine_args_compatible(kwargs)
+            install_gdn_engine_patch()
+
         # NOTE: for the registration to reach spawned mp/async workers, run the engine in-process
         # (VLLM_ENABLE_V1_MULTIPROCESSING=0) OR expose the wrapper as a vLLM general plugin. The
         # in-process path is validated first; the plugin path is the production form. See
