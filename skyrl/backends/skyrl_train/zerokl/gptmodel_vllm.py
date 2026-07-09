@@ -376,17 +376,16 @@ class GPTModelVLLMWrapper(nn.Module):
         # swap attention -> vLLM paged
         cfg = self.gpt.config
         head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
-        # Megatron shards attention heads across TP, so core_attention sees per-RANK head counts.
-        # vLLM's Attention layer likewise expects the local head counts.
-        if cfg.num_attention_heads % self._tp_size or cfg.num_query_groups % self._tp_size:
-            raise ValueError(
-                f"[zerokl] heads ({cfg.num_attention_heads}) and query groups "
-                f"({cfg.num_query_groups}) must both divide TP={self._tp_size}"
-            )
+        # Megatron shards attention heads across TP, so core_attention sees per-RANK head counts
+        # (including the kv-replication case num_query_groups < TP -> 1 kv head/rank, e.g.
+        # Qwen3.5-35B-A3B's 16q/2kv at TP=8). vLLM's Attention layer likewise expects local counts.
+        from skyrl.backends.skyrl_train.zerokl.megatron_varlen_attn import zerokl_local_head_counts
+
+        local_q, local_kv = zerokl_local_head_counts(cfg, self._tp_size)
         swap_core_attention(
             self.gpt,
-            num_heads=cfg.num_attention_heads // self._tp_size,
-            num_kv_heads=cfg.num_query_groups // self._tp_size,
+            num_heads=local_q,
+            num_kv_heads=local_kv,
             head_dim=head_dim,
             scale=head_dim ** -0.5,
         )

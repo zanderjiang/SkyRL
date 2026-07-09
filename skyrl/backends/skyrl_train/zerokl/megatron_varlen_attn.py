@@ -23,6 +23,28 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 
+def zerokl_local_head_counts(cfg, tp: int) -> tuple[int, int]:
+    """Per-RANK (q_heads, kv_heads) that Megatron's SelfAttention hands core_attention at TP=tp.
+
+    Mirrors megatron.core.transformer.attention.Attention.__init__: when num_query_groups < TP,
+    Megatron REPLICATES kv heads (all-gather + slice inside get_query_key_value_tensors -- pure
+    data movement, so bitwise-safe) and each rank runs num_attention_heads/TP q heads over ONE kv
+    group. Qwen3.5-35B-A3B (16 q heads, 2 groups) needs this at TP=8: 2 q / 1 kv per rank.
+    Shared by the trainer swap below and the engine's swap_core_attention (gptmodel_vllm).
+    """
+    q, g = cfg.num_attention_heads, cfg.num_query_groups
+    if q % tp:
+        raise ValueError(f"[zerokl] num_attention_heads ({q}) must divide TP={tp}")
+    if g >= tp:
+        if g % tp:
+            raise ValueError(f"[zerokl] num_query_groups ({g}) must divide TP={tp}")
+        return q // tp, g // tp
+    if tp % g:
+        raise ValueError(f"[zerokl] TP={tp} must be a multiple of num_query_groups ({g}) "
+                         "for megatron's kv-replication path")
+    return q // tp, 1
+
+
 class TorchVarlenCoreAttn(nn.Module):
     """Drop-in for ``SelfAttention.core_attention`` using torch ``varlen_attn`` == the engine kernel."""
 
@@ -197,18 +219,17 @@ def swap_trainer_core_attention_varlen(gpt_modules):
             continue
         cfg = inner.config
         head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
-        # Megatron shards attention heads across TP, so core_attention receives PER-RANK head counts.
-        # (The engine's swap_core_attention does the same division.) At TP=1 this is a no-op.
+        # Megatron shards attention heads across TP, so core_attention receives PER-RANK head counts
+        # -- including the kv-REPLICATION case (num_query_groups < TP -> 1 kv head per rank), which
+        # Qwen3.5-35B-A3B (16 q / 2 groups) hits at TP=8. Same helper the engine swap uses.
         tp = getattr(cfg, "tensor_model_parallel_size", 1) or 1
-        if cfg.num_attention_heads % tp or cfg.num_query_groups % tp:
-            raise ValueError(f"[zerokl] heads {cfg.num_attention_heads} / groups {cfg.num_query_groups} "
-                             f"must divide TP={tp}")
+        local_q, local_kv = zerokl_local_head_counts(cfg, tp)
         for layer in inner.decoder.layers:
             sa = getattr(layer, "self_attention", None)
             if sa is None or not hasattr(sa, "core_attention"):
                 continue  # GatedDeltaNet layers have no core_attention
             sa.core_attention = TorchVarlenCoreAttn(
-                num_heads=cfg.num_attention_heads // tp, num_kv_heads=cfg.num_query_groups // tp,
+                num_heads=local_q, num_kv_heads=local_kv,
                 head_dim=head_dim, scale=head_dim ** -0.5)
             n += 1
     import os as _os2
