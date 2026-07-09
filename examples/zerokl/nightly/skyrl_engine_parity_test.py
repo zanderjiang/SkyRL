@@ -20,6 +20,11 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 N = int(os.environ.get("PARITY_NTOK", "256"))
 MODEL = os.environ.get("ZEROKL_MODEL", "/mnt/local_storage/models/MiMo-7B-RL")
+# Qwen3.5 (hybrid GDN): temp 1.0 exercises the sampler, max_num_seqs sizes the open-chunk buffers,
+# and limit_mm_per_prompt keeps vLLM's startup profiling out of the (absent) vision processor.
+TEMP = float(os.environ.get("PARITY_TEMP", "0.0"))
+MAX_NUM_SEQS = int(os.environ.get("PARITY_MAX_NUM_SEQS", "8"))
+MM_ZERO = os.environ.get("PARITY_MM_ZERO") == "1"
 
 import torch  # noqa: E402
 import vllm.envs as vllm_envs  # noqa: E402
@@ -46,9 +51,11 @@ llm = LLM(
     enforce_eager=True,
     gpu_memory_utilization=0.55,
     max_model_len=2048,
+    max_num_seqs=MAX_NUM_SEQS,
     enable_prefix_caching=False,
     enable_chunked_prefill=False,
     trust_remote_code=True,
+    **({"limit_mm_per_prompt": {"image": 0, "video": 0}} if MM_ZERO else {}),
 )
 
 tok = llm.get_tokenizer()
@@ -64,7 +71,8 @@ prompt2 = ("Solve step by step: a train travels at 60 mph for 2.5 hours, then 40
            "hours. Explain how to find the total distance and discuss factors affecting it.")
 p2 = tok(prompt2, add_special_tokens=False).input_ids[:64]
 out = llm.generate([{"prompt_token_ids": p2}],
-                   SamplingParams(temperature=0.0, max_tokens=N, logprobs=0, ignore_eos=True))[0]
+                   SamplingParams(temperature=TEMP, top_p=1.0, seed=0, max_tokens=N,
+                                  logprobs=0, ignore_eos=True))[0]
 comp = out.outputs[0]
 gen_ids = list(comp.token_ids)
 n = len(gen_ids)

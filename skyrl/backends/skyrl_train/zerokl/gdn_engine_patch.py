@@ -133,29 +133,14 @@ def _get_layer_state(self):
 
 
 @torch.no_grad()
-def _zerokl_forward_core(self, mixed_qkv, b, a, core_attn_out):
-    """Drop-in ``QwenGatedDeltaNetAttention._forward_core``: one code path, both phases.
+def chunk_consistent_core(cc, md, mixed_qkv, a, b):
+    """Run one GDN layer's core for a vLLM batch: ``GDNAttentionMetadata`` -> ChunkConsistentGDN.
 
-    ``mixed_qkv`` is PRE-conv (the conv is ours), ``a`` is the gate input, ``b`` the beta input, and
-    ``core_attn_out`` is the caller's output buffer -- exactly what ChunkConsistentGDN wants.
+    Engine-shape plumbing only, shared by the two engines that need it: vLLM's native
+    ``QwenGatedDeltaNetAttention`` (:func:`_zerokl_forward_core`) and the Megatron ``GPTModel``
+    running inside vLLM (``zerokl.gdn_gptmodel``). ``mixed_qkv`` is PRE-conv (the conv is ours),
+    ``a`` is the gate input and ``b`` the beta input. Returns ``o [T, Hv, Dv]``.
     """
-    global CALL_COUNT
-
-    from vllm.forward_context import get_forward_context
-    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-
-    CALL_COUNT += 1
-    md = get_forward_context().attn_metadata
-    if md is None:
-        # V1 profiling run. vLLM warms `self.chunk_gated_delta_rule` here so the Triton autotuner
-        # doesn't OOM benchmarking after the KV cache is allocated. We never call that op (and on
-        # SM90 it resolves to a JIT-compiled FlashInfer kernel, ~5 min), and with a single pinned
-        # config Triton's Autotuner skips benchmarking entirely. Nothing to warm.
-        return
-    assert isinstance(md, dict)
-    md = md[self.prefix]
-    assert isinstance(md, GDNAttentionMetadata)
-
     if md.spec_sequence_masks is not None:
         raise RuntimeError(
             "[zerokl-gdn] speculative decoding advances ssm_state with the spec kernels, which do "
@@ -164,17 +149,16 @@ def _zerokl_forward_core(self, mixed_qkv, b, a, core_attn_out):
 
     n_dec, n_pre = md.num_decodes, md.num_prefills
     if n_dec == 0 and n_pre == 0:
-        return
+        return None
     if md.num_decode_tokens != n_dec:
         raise RuntimeError(f"[zerokl-gdn] expected 1 token per decode, got {md.num_decode_tokens} for {n_dec}")
 
     T = md.num_actual_tokens
     x, b, a = mixed_qkv[:T], b[:T], a[:T]
-    cc = _get_layer_state(self)
     out = torch.empty(T, cc.num_v_heads, cc.head_v_dim, dtype=x.dtype, device=x.device)
 
     # Non-spec token order is decode-first, then prefill (see GDNAttentionMetadata builder), and
-    # core_attn_out rows map 1:1 onto mixed_qkv rows.
+    # output rows map 1:1 onto mixed_qkv rows.
     if n_dec:
         dec_slots = md.non_spec_state_indices_tensor[:n_dec]
         out[:n_dec] = cc.decode(dec_slots, x[:n_dec], a[:n_dec], b[:n_dec])
@@ -194,8 +178,40 @@ def _zerokl_forward_core(self, mixed_qkv, b, a, core_attn_out):
         for i, slot in enumerate(pre_slots):
             s, e = n_dec + qsl[i], n_dec + qsl[i + 1]
             out[s:e] = cc.prefill(int(slot), x[s:e], a[s:e], b[s:e])
+    return out
 
-    core_attn_out[:T] = out
+
+def gdn_metadata(prefix: str):
+    """This layer's ``GDNAttentionMetadata``, or None during a V1 profiling run."""
+    from vllm.forward_context import get_forward_context
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    md = get_forward_context().attn_metadata
+    if md is None:
+        return None
+    assert isinstance(md, dict)
+    md = md[prefix]
+    assert isinstance(md, GDNAttentionMetadata)
+    return md
+
+
+@torch.no_grad()
+def _zerokl_forward_core(self, mixed_qkv, b, a, core_attn_out):
+    """Drop-in ``QwenGatedDeltaNetAttention._forward_core``: one code path, both phases."""
+    global CALL_COUNT
+
+    CALL_COUNT += 1
+    md = gdn_metadata(self.prefix)
+    if md is None:
+        # V1 profiling run. vLLM warms `self.chunk_gated_delta_rule` here so the Triton autotuner
+        # doesn't OOM benchmarking after the KV cache is allocated. We never call that op (and on
+        # SM90 it resolves to a JIT-compiled FlashInfer kernel, ~5 min), and with a single pinned
+        # config Triton's Autotuner skips benchmarking entirely. Nothing to warm.
+        return
+
+    out = chunk_consistent_core(_get_layer_state(self), md, mixed_qkv, a, b)
+    if out is not None:
+        core_attn_out[: out.shape[0]] = out
 
 
 def install_gdn_engine_patch(*, force: bool = False) -> bool:

@@ -170,6 +170,20 @@ class GPTModelVLLMWrapper(nn.Module):
     that reports param names for vLLM's safety check, like TorchTitan's wrapper).
     """
 
+    # Qwen3.5's config declares `rope_parameters.mrope_section`, so vLLM's model runner insists the
+    # model implement SupportsMRoPE (a runtime_checkable Protocol) before it will build positions at
+    # all. Megatron's Qwen3.5 TEXT bridge uses plain 1-D RoPE, and for a text-only request the three
+    # M-RoPE sections are all just the absolute position -- so satisfy the protocol rather than
+    # rewrite the HF config. `forward` collapses the [3, T] positions back to one row.
+    supports_mrope = True
+
+    def get_mrope_input_positions(self, input_tokens, mm_features=None, **kwargs):
+        if mm_features:
+            raise RuntimeError("[zerokl] the GPTModel path is text-only; got multimodal features")
+        n = len(input_tokens)
+        pos = torch.arange(n, dtype=torch.long).unsqueeze(0).repeat(3, 1)
+        return pos, 0  # delta 0: decode positions are the plain absolute positions
+
     def __init__(self, *, vllm_config, prefix="", model_path=None, load_weights=None):
         super().__init__()
         from megatron.bridge import AutoBridge
@@ -201,6 +215,17 @@ class GPTModelVLLMWrapper(nn.Module):
 
             install_fla_shim()
         b = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
+        # Qwen3.5 registers as a VL architecture; the VL bridge does not build a plain GPTModel (and
+        # cannot pack sequences). Force the text bridge, exactly as megatron_worker.init_configs does,
+        # so the engine and the trainer construct the SAME GPTModel.
+        if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+            from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
+                maybe_force_qwen35_text_bridge,
+            )
+
+            if maybe_force_qwen35_text_bridge(b, b.hf_pretrained.config):
+                print("[ZEROKL-WRAP] forced Qwen3.5 TEXT bridge (GPTModel + GDN, not the VL model)",
+                      flush=True)
         mp = b.to_megatron_provider(load_weights=load_weights)
         mp.tensor_model_parallel_size = 1
         mp.pipeline_model_parallel_size = 1
@@ -272,6 +297,27 @@ class GPTModelVLLMWrapper(nn.Module):
             scale=head_dim ** -0.5,
         )
 
+        # Hybrid models (Qwen3.5): 3 of every 4 layers are GatedDeltaNet, which swap_core_attention
+        # skips (no `core_attention` submodule). Give them a vLLM-registered mamba state layer and
+        # chunk-consistent decode. MUST happen here, during model construction: vLLM's KV cache
+        # manager enumerates static_forward_context after __init__ and before allocating state.
+        if os.environ.get("SKYRL_ZEROKL_GDN") == "1":
+            from skyrl.backends.skyrl_train.zerokl.gdn_gptmodel import swap_gdn_core
+
+            n_gdn = swap_gdn_core(self.gpt, vllm_config=vllm_config)
+            if n_gdn == 0:
+                # A hybrid model whose GPTModel contains zero GatedDeltaNet layers is not the model
+                # the checkpoint describes -- every layer came out as dense SelfAttention. It will
+                # build, run, and even be bitwise decode==prefill (a wrong model is self-consistent),
+                # while generating gibberish. Refuse. `make_zerokl_local_layer_spec` currently has no
+                # hybrid branch: it returns megatron-bridge's flat `local_layer_spec`.
+                raise RuntimeError(
+                    "[zerokl-gdn] SKYRL_ZEROKL_GDN=1 but the Megatron GPTModel has no GatedDeltaNet "
+                    "layers. The no-TE local layer spec built dense attention for every layer. A "
+                    "hybrid no-TE spec (GDN on 3 of 4 layers) is required -- see "
+                    "examples/zerokl/nightly/GDN_ZEROKL_REPORT.md, 'What is NOT done'."
+                )
+
         # RoPE-by-absolute-position: GPTModel computes RoPE for sequence-index 0..L-1, but vLLM
         # paged decode feeds 1-token inputs whose true position is N. Index a precomputed RoPE
         # cache by vLLM's `positions` so decode rotates at the right angle (else decode != prefill).
@@ -303,6 +349,19 @@ class GPTModelVLLMWrapper(nn.Module):
         return self.embed_input_ids(input_ids)
 
     def forward(self, input_ids=None, positions=None, inputs_embeds=None, **kwargs):
+        # Qwen3.5's HF config carries `rope_parameters.mrope_section`, so vLLM feeds MRoPE positions
+        # of shape [3, T] (temporal / height / width). Megatron's Qwen3.5 TEXT bridge sets
+        # position_embedding_type="rope" -- plain 1-D RoPE -- and for a text-only request all three
+        # MRoPE rows are identical. Collapse to the temporal row, and refuse anything else rather
+        # than silently rotating at the wrong angle.
+        if positions is not None and positions.ndim == 2 and positions.shape[0] == 3:
+            if not (torch.equal(positions[0], positions[1]) and torch.equal(positions[0], positions[2])):
+                raise RuntimeError(
+                    "[zerokl] MRoPE sections differ -- this request carries image/video positions. "
+                    "The zero-KL GPTModel path is text-only."
+                )
+            positions = positions[0]
+
         # vLLM varlen [total_tokens] -> Megatron [b=1, seq]. GPTModel applies RoPE internally;
         # attention is the swapped vLLM paged layer (ignores attention_mask, uses vLLM metadata).
         tokens = input_ids.unsqueeze(0)

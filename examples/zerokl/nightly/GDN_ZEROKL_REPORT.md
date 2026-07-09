@@ -23,9 +23,14 @@ production engine (Megatron `GPTModel` running inside vLLM) has no GDN/mamba sta
 | R2 | Regression: OLMoE-1B-7B MoE engine parity | **PASS**, 256/256 bitwise, max `0.000000e+00` | `/mnt/local_storage/logs/gdn_regress_moe_olmoe.log` |
 | R3 | Regression: GDN layer decode parity after the LRU refactor | **PASS**, 450/450 bitwise | `/mnt/local_storage/logs/gdn_layer_parity_recheck.log` |
 | 5 | Rollout cost of chunk-consistent decode | **5.78x** slower at 16 seqs (1.96x at 1 seq) | `/mnt/local_storage/logs/gdn_rollout_cost.log` |
-| 3.1 | Engine parity on Qwen3.5 through the GPTModel-in-vLLM wrapper | **NOT RUN** -- wrapper has no GDN path | -- |
+| 3.1 | Engine parity on Qwen3.5 through the GPTModel-in-vLLM wrapper | **FAIL** -- the wrapper builds the wrong model (see below) | `/mnt/local_storage/logs/gdn_gate31_qwen35.log` |
 | 3.2 | Trainer-vs-engine parity on Qwen3.5 | **NOT RUN** -- blocked on 3.1 | -- |
 | 3.3 | Live 5-step DP8 run on Qwen3.5-0.8B | **NOT RUN** -- blocked on 3.1 | -- |
+
+> **Gate 3.1 reported `256/256 bitwise, max 0.0` and that number is worthless.** The generation
+> check in the same log reads `'The capital of France is' -> ' 0 -s\n\n(3 192=".,)5S;'`. A model with
+> the wrong weights is trivially self-consistent between its own decode and its own prefill. The
+> `[GEN]` line is why the test prints it. See [What is NOT done](#what-is-not-done).
 
 ---
 
@@ -220,38 +225,72 @@ chunk grid the recurrent state is pinned to. It was not changed.
 
 ## What is NOT done
 
-**Part 3 items 1-3 are blocked, and not on GDN math.**
+**Part 3 items 1-3 are blocked, and not on GDN math.** The GDN work is finished: the ops, the
+chunk-consistent decode, the invariance pins, and the trainer shim are all built and measured. What
+is missing is the ability to *construct the Qwen3.5 model at all* on the no-TransformerEngine stack.
 
 Gate 2 patches vLLM's *native* `QwenGatedDeltaNetAttention`. SkyRL's production rollout engine is not
-that class -- it is `zerokl/gptmodel_vllm.py`, which runs Megatron's `GPTModel` inside vLLM with
-`SelfAttention.core_attention` swapped for vLLM's paged attention. That wrapper has **no GDN/mamba
-path whatsoever**:
+that class -- it is `zerokl/gptmodel_vllm.py`, which runs Megatron's `GPTModel` inside vLLM.
 
-* it calls `self.gpt(input_ids, position_ids, attention_mask=None)` with no `inference_context`, so
-  Megatron's `GatedDeltaNet.forward` takes its **training** branch. On a decode batch of N
-  single-token requests it would run one chunk kernel over N tokens from a zero state, treating the
-  batch as one contiguous sequence. Wrong, and silently so.
-* it registers no `MambaSpec`, so vLLM allocates no GDN state slots and builds no
-  `GDNAttentionMetadata` -- there is no slot id and no prefill/decode split to drive
-  `ChunkConsistentGDN` with.
+Substantial progress was made and is committed. `zerokl/gdn_gptmodel.py` now provides the
+`swap_gdn_core` analogue of `swap_core_attention`: a `ZeroKLGDNStateLayer` (a real `MambaBase`, since
+vLLM enumerates KV-cache layers with an `isinstance` filter) that gets vLLM to reserve mamba state
+slots and emit `GDNAttentionMetadata`, plus a replacement `GatedDeltaNet.forward` that keeps every
+Megatron module and routes only the conv+chunk core through `ChunkConsistentGDN`. Four further
+blockers were found and fixed on the way, each verified by the next failure moving forward:
 
-The work is a `swap_gdn_core` analogous to the existing `swap_core_attention`: give each Megatron
-`GatedDeltaNet` a vLLM-registered state layer so the KV-cache manager reserves mamba slots and emits
-`GDNAttentionMetadata`, then route its core through `ChunkConsistentGDN` exactly as
-`gdn_engine_patch._zerokl_forward_core` already does. Everything downstream of that -- the class, the
-ops, the invariance pins -- is built and validated here.
+1. `fla.__spec__ is None` -> `importlib.util.find_spec` raised inside
+   `transformers.is_flash_linear_attention_available()`. The facade now carries a real `ModuleSpec`,
+   and declares `__version__ = "0.0.0"` so HF answers "no FLA" and never tries to import
+   `fused_recurrent_gated_delta_rule` from it.
+2. The bridge dispatched to the Qwen3.5 **VL** model. `maybe_force_qwen35_text_bridge` is now applied
+   in the wrapper too, as `megatron_worker` already does.
+3. `layernorm_zero_centered_gamma`. Qwen3.5 normalises with `rms(x) * (1 + w)`; Megatron's no-TE
+   `WrappedTorchNorm` asserts against the flag. `zerokl/zero_centered_norm.py` implements it for both
+   runtimes.
+4. **M-RoPE.** Qwen3.5's config carries `rope_parameters.mrope_section`, so vLLM feeds `[3, T]`
+   positions and requires the model to implement `SupportsMRoPE`. The wrapper now satisfies that
+   protocol and collapses the three (identical, for text) sections to one row.
 
-Also: `Qwen/Qwen3.5-35B-A3B-Base` is not downloaded on this box.
+**The remaining blocker: there is no hybrid no-TE layer spec.** `make_zerokl_local_layer_spec` has no
+hybrid branch -- it returns megatron-bridge's flat `local_layer_spec`, which builds a dense
+`SelfAttention` for *every* layer. The log proves it: `swapped core_attention -> vLLM paged Attention
+on 24 layers`, and `swap_gdn_core` found **zero** `GatedDeltaNet` modules to swap. The engine
+therefore built a 24-layer dense model, loaded none of the checkpoint's GDN weights
+(`copied 0 native tensors`), and generated gibberish -- while reporting `256/256 bitwise`.
+`gptmodel_vllm` now **raises** when `SKYRL_ZEROKL_GDN=1` and zero GDN layers are found, so this class
+of silent wrong-model can never be reported as a pass again.
+
+Two things are needed, in this order:
+
+* **A hybrid no-TE layer spec.** Megatron ships `megatron/core/models/hybrid/hybrid_layer_specs.py`,
+  but its GDN spec asks the backend for `column_parallel_layer_norm_linear()`, which
+  `LocalSpecProvider` returns `None` for (that fused layernorm+linear is a TE module). The local
+  variant must place `in_proj = ColumnParallelLinear` with a separate `input_layernorm`, exactly as
+  `gdn_trainer_shim_test.py::build_layer` already does and Gate 1 validates.
+* **A bridge weight mapping for that spec.** `megatron/bridge/models/qwen/qwen35_bridge.py` maps
+  `decoder.layers.*.self_attention.in_proj.layer_norm_weight` -- the TE fused parameter, which does
+  not exist under the local spec. It also builds HF names as `model.layers.*`, while the Qwen3.5
+  checkpoint (a VL architecture) stores `model.language_model.layers.*`. This is the same class of
+  fix as the existing `patch_olmoe_bridge_for_sequential_mlp`.
+
+Also: `Qwen/Qwen3.5-35B-A3B-Base` is not downloaded on this box (28T free, so not a capacity issue).
 
 Recommended order:
-1. Batch `ChunkConsistentGDN.decode`'s per-slot `_prep` (bitwise-safe; recovers most of the 5.78x).
-2. `swap_gdn_core` for `gptmodel_vllm`, then Gate 3.1 (engine parity on Qwen3.5-0.8B through the
-   wrapper) and 3.2 (trainer-vs-engine parity after native weight sync).
-3. Live 5-step DP8 on Qwen3.5-0.8B; gate on `policy/rollout_train_logprobs_abs_diff_mean <= 1e-6` at
+1. Hybrid no-TE layer spec + Qwen3.5 bridge mapping patch. Verify by generation coherence FIRST
+   (`[GEN]` must be English), then by bitwise parity. A bitwise number from a wrong model is worse
+   than no number.
+2. Gate 3.1 (engine parity on Qwen3.5-0.8B through the wrapper) and 3.2 (trainer-vs-engine parity
+   after native weight sync).
+3. Batch `ChunkConsistentGDN.decode`'s per-slot `_prep` (bitwise-safe; recovers most of the 5.78x).
+   Do this before any large-scale run -- at 35B's concurrency the per-slot loop will dominate.
+4. Live 5-step DP8 on Qwen3.5-0.8B; gate on `policy/rollout_train_logprobs_abs_diff_mean <= 1e-6` at
    **every** step including 2-5, `policy_kl == 0.0`. A clean step 1 with a dirty step 2 is the
    sleep/wake weight-clobber class of bug, not a GDN bug -- set `SKYRL_ZEROKL_DEBUG=1` and check
    `[ZEROKL-REAPPLY] == [SENDER] == [ZEROKL-ENGFWD]`.
-4. Only then Qwen3.5-35B-A3B on GSM8K.
+5. Only then Qwen3.5-35B-A3B on GSM8K. Note the launcher's CAVEAT block
+   (`examples/train/zerokl/run_megatron_qwen3.5_35b_a3b_gsm8k_zerokl.sh`) still says the GDN
+   divergence is unresolved; that is now true only of the GPTModel path, not of the GDN algorithm.
 
 ---
 

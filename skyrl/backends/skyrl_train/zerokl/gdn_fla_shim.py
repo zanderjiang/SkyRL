@@ -45,6 +45,7 @@ It is called from ``zerokl/__init__.py`` (which ``megatron_worker.py`` imports b
 
 from __future__ import annotations
 
+import importlib.machinery
 import logging
 import os
 import sys
@@ -103,6 +104,19 @@ def _shim_chunk_gated_delta_rule(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+    )
+
+
+def _no_recurrent(*_a, **_k):
+    """`fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule` -- present only to fail loudly.
+
+    The recurrent kernel is exactly what chunk-consistent decode replaces: it is algebraically equal
+    to the chunk kernel and numerically different (mean 1.7e-2 in logprob). Nothing in the zero-KL
+    path may call it.
+    """
+    raise NotImplementedError(
+        "[zerokl-gdn] the fused recurrent delta-rule kernel is not batch-invariant with the chunk "
+        "kernel used at training/prefill. Use zerokl.gdn_chunk_consistent.ChunkConsistentGDN."
     )
 
 
@@ -241,6 +255,10 @@ def _patch_megatron_gdn_eager() -> bool:
 # ---------------------------------------------------------------------------------------------
 def _module(name: str, **attrs) -> types.ModuleType:
     mod = types.ModuleType(name)
+    # A module with `__spec__ = None` makes `importlib.util.find_spec(name)` raise ValueError, and
+    # `transformers.utils.is_flash_linear_attention_available()` calls exactly that on `fla` while
+    # importing Qwen3-Next. Give the facade a real (loader-less) spec.
+    mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
     mod.__dict__.update(attrs)
     sys.modules[name] = mod
     return mod
@@ -267,9 +285,15 @@ def install_fla_shim(*, force: bool = False) -> bool:
             "(and one autotune decision)."
         )
 
-    fla = _module("fla", __zerokl_shim__=True, __path__=[])
+    # __version__ "0.0.0": `transformers.is_flash_linear_attention_available()` requires >= 0.2.2 and
+    # falls back to the module's __version__ when there is no distribution metadata. Declaring an old
+    # version makes HF answer "no FLA" and use its own torch reference, which is what we want -- its
+    # Qwen3-Next modeling would otherwise import `fused_recurrent_gated_delta_rule` from this facade.
+    # Megatron imports our symbols by name and never consults that check.
+    fla = _module("fla", __zerokl_shim__=True, __version__="0.0.0", __path__=[])
     ops = _module("fla.ops", __path__=[])
-    gdr = _module("fla.ops.gated_delta_rule", chunk_gated_delta_rule=_shim_chunk_gated_delta_rule)
+    gdr = _module("fla.ops.gated_delta_rule", chunk_gated_delta_rule=_shim_chunk_gated_delta_rule,
+                  fused_recurrent_gated_delta_rule=_no_recurrent)
     modules = _module("fla.modules", __path__=[])
     conv = _module("fla.modules.convolution", causal_conv1d=_shim_causal_conv1d)
     l2 = _module("fla.modules.l2norm", l2norm=_shim_l2norm)
@@ -286,6 +310,12 @@ def install_fla_shim(*, force: bool = False) -> bool:
 
     if _eager_prep_enabled():
         _patch_megatron_gdn_eager()
+
+    # Qwen3.5 normalises with rms(x) * (1 + w); the no-TE torch norm asserts against that flag and
+    # would abort while building the first layer, in the trainer and in the in-vLLM GPTModel alike.
+    from .zero_centered_norm import install_zero_centered_torch_norm
+
+    install_zero_centered_torch_norm()
 
     # Pin the Triton autotune configs now if vLLM is importable in this process; `gdn_chunk` pins
     # again (idempotently) before its first launch, so a deferred pin is safe, never skipped.
