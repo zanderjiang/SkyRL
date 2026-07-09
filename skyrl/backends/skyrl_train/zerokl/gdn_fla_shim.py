@@ -237,8 +237,28 @@ def _eager_prepare_qkv(self, qkv, gate, beta, alpha, batch, seq_len):
     )
 
 
+def _eager_apply_gated_norm(self, x, gate):
+    """Eager copy of ``GatedDeltaNet._apply_gated_norm`` (no ``@jit_fuser``).
+
+    THE TP>1 decode-vs-prefill drift (found live at TP=2, Qwen3.5-0.8B): ``jit_fuser`` is
+    ``torch.compile`` on this stack, and inductor SHAPE-SPECIALIZES the fused norm+silu+mul kernel.
+    Decode (rows = tokens*heads_local, e.g. 8) and prefill (e.g. 880) compile different kernels whose
+    fp32 reductions round differently on the same row -- a sporadic last-ulp diff that compounds
+    through 18 GDN layers into ~1e-1 logprob drift, and leaks ACROSS ranks through out_proj's
+    row-parallel allreduce. At TP=1 the shape pair happened to agree, which is why Gate 3.3 passed
+    there. Eager aten (rms_norm is M-invariant; the rest is elementwise) is shape-invariant.
+    """
+    x_dtype = x.dtype
+    x = x.reshape(-1, x.shape[-1])
+    y = self.out_norm(x)
+    gate = gate.reshape(-1, gate.shape[-1])
+    y = y * self.act_fn(gate.float())
+    y = y.to(x_dtype)
+    return y
+
+
 def _patch_megatron_gdn_eager() -> bool:
-    """Rebind the two ``jit_fuser``-decorated helpers to eager equivalents. Returns True if done."""
+    """Rebind the three ``jit_fuser``-decorated helpers to eager equivalents. Returns True if done."""
     try:
         from megatron.core.ssm import gated_delta_net as mg
     except Exception as e:  # pragma: no cover - megatron absent (engine-only process)
@@ -246,7 +266,9 @@ def _patch_megatron_gdn_eager() -> bool:
         return False
     mg.GatedDeltaNet._compute_g_and_beta = _eager_compute_g_and_beta
     mg.GatedDeltaNet._prepare_qkv_for_gated_delta_rule = _eager_prepare_qkv
-    print("[ZEROKL-GDN] megatron GatedDeltaNet: g/beta + qkv-prep run EAGER (no torch.compile)", flush=True)
+    mg.GatedDeltaNet._apply_gated_norm = _eager_apply_gated_norm
+    print("[ZEROKL-GDN] megatron GatedDeltaNet: g/beta + qkv-prep + gated-norm run EAGER "
+          "(no torch.compile)", flush=True)
     return True
 
 

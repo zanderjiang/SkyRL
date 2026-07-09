@@ -151,9 +151,16 @@ def force_zerokl_moe_config(provider, *, side: str) -> None:
     _set_if_present(provider, "moe_router_force_load_balancing", False, changes)
     _set_if_present(provider, "moe_router_force_biased", None, changes)
     _set_if_present(provider, "moe_shared_expert_overlap", False, changes)
-    # EP/ETP must be 1: expert sharding changes the combine's reduction into a collective.
+    # EP must be 1: EP>1 turns the top-k expert COMBINE into a cross-rank collective whose
+    # summation order depends on how many tokens each remote rank contributed -> batch-variant.
     _set_if_present(provider, "expert_model_parallel_size", 1, changes)
-    _set_if_present(provider, "expert_tensor_parallel_size", 1, changes)
+    # ETP must EQUAL the dense TP (not 1): the zero-KL invariant is that trainer and engine run
+    # the SAME sharded module, and gptmodel_vllm pins the engine's ETP to its TP. Intra-expert
+    # TP (column/row-parallel fc1/fc2) only adds the same allreduce on both sides -- deterministic
+    # under the pinned NCCL algo and bitwise-identical because the operands are identical. At the
+    # original TP=1 validation scope this reduces to the old ETP=1 pin.
+    _tp = getattr(provider, "tensor_model_parallel_size", 1) or 1
+    _set_if_present(provider, "expert_tensor_parallel_size", _tp, changes)
 
     print(
         f"[ZEROKL-{side}] MoE zero-KL recipe pinned "

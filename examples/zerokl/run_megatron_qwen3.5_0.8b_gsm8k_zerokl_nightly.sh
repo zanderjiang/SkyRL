@@ -15,11 +15,11 @@ set -x
 # sleep/wake weight-clobber class of bug, not a GDN bug -- set SKYRL_ZEROKL_DEBUG=1 and compare the
 # [ZEROKL-REAPPLY] == [SENDER] == [ZEROKL-ENGFWD] checksums.
 #
-# Why 0.8B and not 35B-A3B: the unified GPTModel-in-vLLM wrapper and the native weight sync are
-# TP=1-scoped (`gptmodel_vllm.py`: `mp.tensor_model_parallel_size = 1`; `native_weight_sync.py`:
-# "Scope: TP=1 parity path"). Qwen3.5-35B-A3B needs matched TP=8 -- 70 GB of bf16 weights cannot be
-# held twice (trainer + engine) on one 80 GB GPU at TP=1. That is a separate workstream and it is
-# NOT a GDN problem; the GDN stack here is TP-agnostic.
+# Matched TP>1 (ZEROKL_TP=2 here) is the staging ground for Qwen3.5-35B-A3B, which needs matched
+# TP=8: 70 GB of bf16 weights cannot be held twice (trainer + engine) on one 80 GB GPU at TP=1.
+# The wrapper builds a TP-sharded GPTModel over vLLM's worker group (gptmodel_vllm.py), the native
+# sync ships per-rank shards via GPU-keyed CUDA-IPC, and the trainer's logprob extraction gathers
+# the full vocab row to bitwise-match the engine's gathered-logits formula (model_utils.py).
 #
 # Rollout is ~5.8x slower than stock vLLM at 16 concurrent sequences: chunk-consistent decode
 # re-runs the training chunk kernel over the open chunk, and today does it in a per-slot python loop.

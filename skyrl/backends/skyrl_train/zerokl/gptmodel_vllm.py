@@ -14,9 +14,13 @@ Pieces:
   - register_gptmodel_to_vllm: ModelRegistry.register_model + a config parser so vLLM builds
     THIS class for our custom architecture name.
 
-Scope: TP=1, enforce_eager (breakable cudagraph absent in this vLLM). Generator attention uses
-vLLM's vendored flash backend (proven == TE-flash; torch 2.11 lacks torch-native paged varlen).
-Weights arrive via native sync (no HF) -> load_weights is effectively a copy/no-op.
+Scope: matched TP (Megatron TP == vLLM TP; TP=1 and TP>1), enforce_eager (breakable cudagraph
+absent in this vLLM). At TP>1 the wrapper initializes Megatron model-parallel state over vLLM's
+worker process group (single-node TP only: the worker world must BE the TP group) and builds the
+same sharded GPTModel the trainer runs; the column-parallel output layer gathers logits
+(parallel_output=False) for vLLM's sampler. Generator attention uses vLLM's vendored flash
+backend (proven == TE-flash; torch 2.11 lacks torch-native paged varlen). Weights arrive via
+native sync (no HF) -> load_weights is effectively a copy/no-op.
 """
 
 from __future__ import annotations
@@ -425,6 +429,72 @@ class GPTModelVLLMWrapper(nn.Module):
             except Exception as _e:  # pragma: no cover
                 print(f"[ZEROKL-WRAP] logprob patch failed: {type(_e).__name__}: {_e}", flush=True)
         self._fwd_probe_done = False
+        # SKYRL_ZEROKL_LAYERTRACE=<dir>: per-forward, per-layer output dump for offline decode-vs-
+        # prefill bisection at TP>1 (in-process hooks cannot reach vLLM's mp workers, so each worker
+        # writes its own trace). One .pt per forward: {"rank", "fwd", "nrows", "layers": {i: [s, h]}}.
+        _trace_dir = os.environ.get("SKYRL_ZEROKL_LAYERTRACE")
+        if _trace_dir:
+            os.makedirs(_trace_dir, exist_ok=True)
+            self._zk_trace = {"dir": _trace_dir, "fwd": 0,
+                              "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}
+            _store = {}
+
+            def _mk_hook(idx):
+                def _h(_m, _a, out):
+                    h = out[0] if isinstance(out, tuple) else out
+                    _store[idx] = h.detach().float().reshape(-1, h.shape[-1]).cpu()
+                return _h
+
+            for _i, _layer in enumerate(self.gpt.decoder.layers):
+                _layer.register_forward_hook(_mk_hook(_i))
+
+            # SKYRL_ZEROKL_LAYERTRACE_SUBLAYER=<i>: additionally trace INSIDE layer i's GDN
+            # (in_proj out, core in/out, out_proj in/out) to pinpoint the diverging op.
+            _sub = os.environ.get("SKYRL_ZEROKL_LAYERTRACE_SUBLAYER")
+            if _sub is not None:
+                _gdn = self.gpt.decoder.layers[int(_sub)].self_attention
+
+                def _flt(t):
+                    return t.detach().float().reshape(-1, t.shape[-1]).cpu()
+
+                def _in_proj_hook(_m, _a, o):
+                    _store["sub_in_proj_out"] = _flt(o[0] if isinstance(o, tuple) else o)
+                    return None  # a non-None hook return would REPLACE the module output
+
+                def _out_proj_hook(_m, a, o):
+                    _store["sub_out_proj_in"] = _flt(a[0])
+                    _store["sub_out_proj_out"] = _flt(o[0] if isinstance(o, tuple) else o)
+                    return None
+
+                _gdn.in_proj.register_forward_hook(_in_proj_hook)
+                _gdn.out_proj.register_forward_hook(_out_proj_hook)
+                _orig_core = _gdn._zerokl_state.forward
+
+                def _traced_core(mixed_qkv, a, b):
+                    _store["sub_core_in_x"] = _flt(mixed_qkv)
+                    _store["sub_core_in_a"] = _flt(a)
+                    _store["sub_core_in_b"] = _flt(b)
+                    out = _orig_core(mixed_qkv, a, b)
+                    if out is not None:
+                        _store["sub_core_out"] = out.detach().float().reshape(out.shape[0], -1).cpu()
+                    return out
+
+                _gdn._zerokl_state.forward = _traced_core
+                print(f"[ZEROKL-TRACE] sub-layer tracing GDN layer {_sub}", flush=True)
+
+            _wrap_self = self
+
+            def _flush_trace(nrows):
+                t = _wrap_self._zk_trace
+                torch.save({"rank": t["rank"], "fwd": t["fwd"], "nrows": nrows,
+                            "layers": dict(_store)},
+                           os.path.join(t["dir"], f"r{t['rank']}_f{t['fwd']:05d}_n{nrows}.pt"))
+                _store.clear()
+                t["fwd"] += 1
+
+            self._zk_flush_trace = _flush_trace
+        else:
+            self._zk_flush_trace = None
         with torch.no_grad():
             _w = next((p for n, p in self.gpt.named_parameters() if "weight" in n), None)
             _wn = float(_w.float().norm()) if _w is not None else -1.0
@@ -490,6 +560,8 @@ class GPTModelVLLMWrapper(nn.Module):
         # let compute_logits pass through (pragmatic bring-up; TODO split hidden vs lm_head).
         if out.dim() == 3:
             out = out.reshape(-1, out.shape[-1])
+        if self._zk_flush_trace is not None:
+            self._zk_flush_trace(int(out.shape[0]))
         self._fwd_count = getattr(self, "_fwd_count", 0) + 1
         if os.environ.get("SKYRL_ZEROKL_BISECT") == "1" and self._fwd_count in (1, 2, 50):
             # Engine RUNTIME weight checksum over the NON-MTP params (the 255 the trainer syncs),

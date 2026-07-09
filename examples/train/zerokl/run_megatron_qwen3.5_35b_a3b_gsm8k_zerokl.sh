@@ -58,7 +58,7 @@ set -x
 #       > /mnt/local_storage/logs/zerokl_gsm8k_qwen3.5_35b.log 2>&1
 
 DATA_DIR="$HOME/data/gsm8k"
-LOGGER="wandb"  # change to "console" to print to stdout
+LOGGER="${ZEROKL_LOGGER:-wandb}"  # ZEROKL_LOGGER=console prints step metrics to stdout (gate validation)
 MODEL_NAME="Qwen/Qwen3.5-35B-A3B-Base"
 
 INFERENCE_BACKEND="vllm" # currently only vllm is supported for megatron
@@ -105,7 +105,10 @@ DISTRIBUTED_EXECUTOR_BACKEND="mp"
 # ===== zero-KL switches =====
 export SKYRL_ZERO_KL=1
 export SKYRL_ZEROKL_LOCAL_SPEC=1
-export SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS=1   # engine GPTModel is populated by the first native sync, not HF disk load
+# 0: the engine GPTModel is populated by the FIRST NATIVE SYNC (which precedes the first rollout),
+# not by an HF disk load at init. At 35B, =1 would have all 8 TP workers stream the 70GB HF
+# checkpoint through host RAM at engine build for weights that are immediately overwritten.
+export SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS=0
 export SKYRL_ZEROKL_MOE_DETERMINISTIC=1     # fixed-order expert combine + sorted router top-k
 export SKYRL_ZEROKL_GDN=1                   # fla shim (trainer) + hybrid no-TE spec + chunk-consistent decode (engine)
 export VLLM_BATCH_INVARIANT=1
@@ -125,6 +128,10 @@ export SKYRL_ZEROKL_NO_CHUNKED_PREFILL=1
 export SKYRL_ZEROKL_MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 export _SKYRL_USE_NEW_INFERENCE=0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+# vLLM's Qwen3.5 module imports the VL chain unconditionally; torchvision is absent from the zerokl
+# venv. The stub only has to satisfy the import. (Same as the 0.8B nightly launcher.)
+export PYTHONPATH="$(cd "$(dirname "$0")/../../zerokl/nightly/_torchvision_stub" && pwd)${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME="${HF_HOME:-/mnt/local_storage/hf}"
 
 # On Blackwell, use the following env vars:
 # export VLLM_USE_FLASHINFER_MOE_FP16=0   # force triton moe backend since flashinfer trtllm bf16 MoE kernel requires expert intermediate_size to be a multiple of 128

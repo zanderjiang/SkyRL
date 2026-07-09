@@ -750,6 +750,16 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         env_vars["SKYRL_ZERO_KL"] = os.environ["SKYRL_ZERO_KL"]
         # in-process vLLM so the GPTModel string-registration in the engine actor reaches model build
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # NCCL determinism pins for the TRAINER workers (same values the engine gets from
+        # zerokl.vllm_patches.ZEROKL_VLLM_ENV via apply_vllm_zerokl_env). At TP>1 the FORWARD
+        # itself contains allreduces (RowParallelLinear activations, the ETP expert combine), and
+        # bitwise trainer==engine requires the two communicators to reduce in the SAME order. A
+        # 2-rank sum is order-free, but at TP>=4 NCCL picks ring-vs-tree per message size unless
+        # pinned -- so pin BOTH sides to tree/1-channel. (Engine-only pinning was enough at TP=1
+        # where the forward has no collectives at all.)
+        env_vars["NCCL_ALGO"] = "allreduce:tree"
+        env_vars["NCCL_MIN_NCHANNELS"] = "1"
+        env_vars["NCCL_MAX_NCHANNELS"] = "1"
         for _zk in ("SKYRL_ZEROKL_ENGINE_LOAD_WEIGHTS", "SKYRL_ZEROKL_SCORING_FORWARD", "SKYRL_ZEROKL_TRAINER_PATCHES", "SKYRL_ZEROKL_BISECT",
                     "SKYRL_ZEROKL_NO_CHUNKED_PREFILL", "SKYRL_ZEROKL_MAX_MODEL_LEN", "SKYRL_ZEROKL_FWD_PROBE", "SKYRL_ZEROKL_SEQ_PROBE",
                     # trainer core_attention kernel selection: match the engine's PAGED varlen_attn_out

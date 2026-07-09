@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Optional
 
 import megatron.core.parallel_state as mpu
@@ -40,6 +41,25 @@ def _compute_distributed_log_softmax(
         torch.Tensor: Log softmax output with the same shape as input, but values represent
             log probabilities normalized across the full vocabulary dimension.
     """
+    # SkyRL-ZeroKL: at TP>1 the distributed reduction below computes lse as
+    # log(allreduce_sum(per-shard aten sums)), whose fp32 summation order differs from the
+    # generator's single-row aten sum over the GATHERED full vocab (gptmodel_vllm sets
+    # parallel_output=False; the sampler patch computes x - amax(x) - log(sum(exp(x))) on the
+    # full row). Measured: ~60% of rows differ in the last ulp (|lse diff| up to ~3e-7) -- small
+    # but not bitwise. Under zero-KL, gather the shards (pure data movement, bitwise) and use the
+    # generator's exact single-row formula; the local shard's logprobs are then elementwise
+    # identical to the corresponding slice of the generator's full-row logprobs.
+    if os.environ.get("SKYRL_ZERO_KL") == "1" and torch.distributed.get_world_size(group=group) > 1:
+        world = torch.distributed.get_world_size(group=group)
+        shard = vocab_parallel_logits.contiguous()
+        gathered = [torch.empty_like(shard) for _ in range(world)]
+        torch.distributed.all_gather(gathered, shard, group=group)
+        full = torch.cat(gathered, dim=-1)
+        logits_max = torch.amax(full, dim=-1, keepdim=True)
+        x_full = full - logits_max
+        lse = x_full.exp().sum(-1, keepdim=True).float().log()
+        return (vocab_parallel_logits - logits_max) - lse.to(vocab_parallel_logits.dtype)
+
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
     torch.distributed.all_reduce(
         logits_max,

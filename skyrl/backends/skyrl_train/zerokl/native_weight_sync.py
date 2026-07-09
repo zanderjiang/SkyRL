@@ -11,8 +11,13 @@ HF->fused repack -- plus the seam risks they carried (vocab padding, QKV interle
 Kept: transport (the caller still moves bytes via CUDA-IPC/NCCL), the bf16 cast, and TP
 reshard *only if* degrees differ (native-layout reshard, not a format conversion).
 
-Scope: TP=1 parity path (DTensors are materialized via ``full_tensor``). For TP>1 the reshard
-belongs in the transport layer; the names/layout here are unchanged.
+TP>1 (matched TP): both sides shard identically (Megatron TP == vLLM TP, same rank->GPU
+placement), so each trainer rank's ``named_parameters()`` are already the exact per-rank shards
+the colocated engine worker needs -- same names, same shapes. No reshard happens or is needed:
+the CUDA-IPC transport keys handles by PHYSICAL GPU UUID, so engine TP rank r opens the packed
+buffer of the trainer rank on the same GPU (see weight_sync/cuda_ipc_strategy.py). The shard
+routing is therefore correct iff trainer TP rank r and engine TP rank r share a GPU -- which the
+colocated placement guarantees (both count ranks over CUDA_VISIBLE_DEVICES in order).
 """
 
 from __future__ import annotations
