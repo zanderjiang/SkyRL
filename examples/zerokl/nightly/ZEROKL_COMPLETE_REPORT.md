@@ -1,7 +1,10 @@
 # How we achieved bitwise zero-KL
 
-*Scope: everything except tensor parallelism (the TP>1 engine work is separate and unvalidated —
-see the `WIP engine tensor parallelism` commit). Everything below was measured at TP=PP=EP=CP=1.*
+*Sections 0–8 were measured at TP=PP=EP=CP=1. Sections 9–12 extend the result to **matched
+tensor parallelism** (Megatron TP == vLLM TP), take it to **Qwen3.5-35B-A3B** at TP=8, make it
+**train efficiently**, and document two metric traps that cost real time. The 35B run is
+bitwise: rollout logprobs equal the trainer's forward on identical weights, exactly, on all
+375,441 response tokens, with no TIS/MIS.*
 
 ---
 
@@ -687,7 +690,187 @@ reference VJP (§6.5) and the fp32 RMSNorm backward (§3.3). Megatron makes the 
 
 ---
 
-## 9. The recipe
+## 9. Matched tensor parallelism (TP>1)
+
+Everything above holds at TP=1. Scaling to a model that does not fit twice on one GPU (trainer +
+colocated engine) needs matched TP: **Megatron TP must equal vLLM TP**, because the trainer's
+forward and the in-vLLM GPTModel forward must run the *same* sharded computation. A row-parallel
+all-reduce over 2 ranks rounds differently than over 8; "same model" now means "same shards,
+reduced in the same order."
+
+### 9.1 The engine builds a TP-sharded GPTModel inside vLLM
+
+At TP=1 with `VLLM_ENABLE_V1_MULTIPROCESSING=0` the engine actor *is* the worker, so the
+registrations from section 2 reached the model build directly. At TP>1 vLLM spawns one worker
+subprocess per rank, and none of them ran any of it — the first symptom was blunt:
+`Model architectures ['MegatronGPTModelHybridForCausalLM'] are not supported`. The fix is a
+`vllm.general_plugins` entry point (`zerokl/vllm_plugin.py`): vLLM calls `load_general_plugins()`
+in **every** worker, which is the only hook that reaches the spawned processes. It installs the
+whole stack (GPTModel registration, CUSTOM varlen backend, batch-invariant sampler, GDN pins) per
+worker, idempotently, gated on `SKYRL_ZERO_KL=1`.
+
+The wrapper then initializes Megatron model-parallel state over vLLM's own worker process group
+(`mpu.initialize_model_parallel(tp)`; single-node TP only — the worker world must *be* the TP
+group), builds the same sharded GPTModel the trainer runs, and sets `parallel_output=False` so the
+column-parallel output layer gathers logits for vLLM's sampler.
+
+### 9.2 Weight sync at TP>1 is correct by construction
+
+The concern was that the sync could silently deliver rank 0's shard to every engine rank. It does
+not, and the reason is the transport, not luck: the CUDA-IPC path keys handles by **physical GPU
+UUID** (`weight_sync/cuda_ipc_strategy.py`). Each trainer rank's `named_parameters()` are already
+the exact per-rank shards, and colocated placement puts trainer TP rank *r* and engine TP rank *r*
+on the *same* GPU — so engine rank *r* opens the shard of the trainer rank on its own GPU. No
+reshard happens or is needed. Verified digit-for-digit: the `[ZEROKL-CKSUM]` SENDER, RECEIVER, and
+ENGFWD (the weights the forward actually reads) totals are equal on every worker, per rank, every
+sync.
+
+### 9.3 The trainer's logprob gather must match the engine's row formula
+
+At TP>1 the trainer's `_compute_distributed_log_softmax` computes `lse` as
+`log(all_reduce_sum(per-shard exp-sums))`, whose fp32 summation order differs from the engine's
+single-row `sum(exp(·))` over the **gathered** full vocab (the engine has `parallel_output=False`).
+Measured: ~60% of rows differed in the last ULP, up to `1.9e-6` — small, not bitwise. Fix: under
+`SKYRL_ZERO_KL=1` at TP>1, the trainer all-gathers the vocab shards (pure data movement, bitwise)
+and applies the engine's exact single-row formula (`distributed/megatron/model_utils.py`). The
+contiguous `[..., V]` layout is load-bearing — aten's `sum` reduces in a shape-dependent order, and
+only that layout reproduces the engine's `lse`. (At 35B this gather held ~4 full-vocab fp32 copies
+and OOMed at `micro_batch>1`; it is now done in place with a `logprobs_chunk_size` bound — see §11.)
+
+### 9.4 The decisive TP=2 bug: a `torch.compile`d gated norm
+
+At TP=1 the Qwen3.5-0.8B GDN hybrid passed the gate. At TP=2 the same model failed:
+`policy_kl` clean but `rollout_train_logprobs_abs_diff` mean `0.003`, **max `0.35`** — and the
+standalone engine's own decode-vs-prefill diverged (max `0.16`, onset mid-second-chunk).
+
+Root cause, localized by per-worker layer tracing (`SKYRL_ZEROKL_LAYERTRACE` — in-process hooks
+cannot reach vLLM's mp workers, so each worker writes its own trace): Megatron's
+`GatedDeltaNet._apply_gated_norm` still carried `@jit_fuser`, which is `torch.compile` on this
+stack. Inductor **shape-specializes** the fused `rms_norm + silu + mul` kernel, so a decode step
+(rows = tokens×heads_local = 8 at TP=2) and the prefill that rescores it (~880 rows) run *different*
+compiled kernels whose fp32 reductions differ in the last ULP. That noise compounds through 18 GDN
+layers and **leaks across ranks** via `out_proj`'s row-parallel all-reduce (rank 0's clean norm +
+rank 1's dirty norm → both diverge). At TP=1 the two shapes happened to compile to agreeing kernels,
+which is exactly why TP=1 passed and hid it.
+
+This is the *same class* as §6.4 (`RMSNormGated` picking its tile height from the row count) and the
+*same class* as the router's `is_grad_enabled()` top-k (§4.2): **a kernel selected by shape or
+mode**. The `EAGER_PREP` fix had already de-compiled two of GDN's three `@jit_fuser` methods; this
+was the third. Fix: eager rebind of `_apply_gated_norm` (`gdn_fla_shim.py`). Engine decode==prefill
+went from max `0.16` to **512/512 bitwise**; trainer==engine returned to the `~8e-7` floor.
+
+> **Method note.** "Rescore the same sequence twice" distinguishes a race (differs) from a
+> shape-specialization (bitwise) — here it was bitwise, so the divergence was shape-dependent, not
+> nondeterministic. And "decode matches the trainer but prefill doesn't" points at a per-shape
+> kernel, not state corruption.
+
+**Result at TP=2** (Qwen3.5-0.8B, 4 engines × TP2): `policy_kl = 0.0`, `abs_diff_mean` 8.1e-7 /
+8.2e-7 / 8.2e-7 / 8.3e-7 across four steps — the same floor as the TP=1 gate. Dense MiMo-7B at TP=2
+is fully bitwise (512/512).
+
+---
+
+## 10. Qwen3.5-35B-A3B at TP=8
+
+The first full-scale run (256 experts, 40 layers, GDN hybrid, matched TP=8, EP=1, ETP=8) surfaced a
+sequence of blockers — each one a real bug, each found by measurement and fixed bitwise before the
+next. They are worth listing because they are the difference between "works on a 0.8B toy" and
+"trains a 35B model."
+
+| # | Failure | Cause | Fix |
+|---|---|---|---|
+| 1 | `heads (16) and query groups (2) must divide TP=8` | Qwen3.5-35B has 16 q-heads / **2** kv-groups; at TP=8, groups < ranks | Mirror Megatron's **kv-replication** path: 1 kv-head/rank, replicated (all-gather + slice, bitwise); shared `zerokl_local_head_counts` on both swaps |
+| 2 | first weight sync ~90 min | SequentialMLP explodes the native param count to **20,943**; one IPC chunk per param | Bucket into ≤512 MiB chunks → **33 chunks**; the IPC request already carries `(names, shapes, sizes)` |
+| 3 | `MoELayer` raises during training | Megatron's MoE+TP-without-SP **performance** veto (not a correctness assert) | Flip only the parent `MoELayer.training` flag around the call; children keep theirs |
+| 4 | `aten::linear_backward` not implemented on CUDA | We registered CUDA kernels for `aten::matmul`/`aten::linear` — **composite** ops → autograd leaves demanding a `*_backward` that exists only for Meta | Override **primitives only** (`mm`/`addmm`); matmul/linear/`F.linear` decompose onto them and stay differentiable. (Fired only at 35B: OLMoE's every GEMM goes through Megatron's custom-autograd linears; the shared-expert gate calls `F.linear` directly, and the GDN chunk VJP calls `torch.matmul` under grad — that was the *next* crash.) |
+| 5 | engine init OOM (32 GiB) | vLLM profiles at `max_num_batched_tokens`; the wrapper materializes full-vocab fp32 logits per profile row (~16 GB at Qwen3.5's 248,320 vocab) | Cap the profile budget at `max_model_len` |
+| 6 | `TP=4` OOM in `restore_grad_buffers` | Halving TP halves the weight shard but **doubles** the per-rank fp32 DDP grad buffer → 65 GiB/GPU. (A recommendation I made and had to retract — the run asked for exactly the TP=4 grad-buffer size.) | Stay at **TP=8** (32.6 GiB/GPU); efficiency comes from the MoE fix, not lower TP |
+
+Everything static then measured clean at 35B: the engine is bitwise self-consistent (decode ==
+prefill, **128/128, max 0.0**) and coherent; the offline TP=8 trainer scorer agrees with the engine
+to `8e-7`; the trainer is batch-invariant (b=4 logits == b=1 bitwise) and mode-invariant
+(train+grad == eval+no_grad bitwise); MoE at TP>1 is invariant to token count *and* neighbours
+(`moe_tp_invariance_test.py`).
+
+**The gate, live at 35B:** `[ZEROKL-DIFF] n=375441 mean=0.00000 frac>0.05=0.000% top-8 diffs =
+[0.0]×8` — rollout logprobs equal the trainer's forward, **bitwise, on every one of 375,441 response
+tokens**, corroborated by 2,197 same-weight probes all reading exactly `0.0` and every nonzero probe
+falling strictly *after* an optimizer step. Reward climbs 0.58 → 0.79 over six steps; entropy and
+grad-norm are stable. Zero-KL at 35B, no TIS/MIS.
+
+---
+
+## 11. Training efficiently without breaking zero-KL
+
+The first working 35B run was ~130× slower than the non-zero-KL baseline. The cause was not the
+batch-invariant kernels — it was **per-item Python loops** at a scale the 0.8B never reached. Each
+was replaced with a batched op that is bitwise-equal *by construction* (the batch/tile axis never
+enters a reduction), then validated on-GPU before use.
+
+| Loop | Cost (35B, per forward) | Batched replacement | Speedup | Bitwise? |
+|---|---|---|---|---|
+| `SequentialMLP` expert loop (256 experts × 40 layers = 10,240 module calls) | 2140 ms | **fixed-capacity tiled `bmm`** (`moe_batched_experts.py`): scatter each expert's rows into `[n_tiles, CAP, h]`, one `bmm` per fc, ragged gather | **19×** (111 ms) | == sequential; probe row invariant to token count *and* under 9000× routing skew |
+| `ChunkConsistentGDN.decode` per-slot loop (640 slots × 30 layers) | 504 ms/layer | **batched conv + ragged gather** (`gdn_ops.gdn_causal_conv_batched`) | **20×** (25 ms/layer) | 2700/2700 layer-parity tokens exact |
+| trainer scoring / training at `micro_batch=1` | 640 micro-batches/pass | **`micro_batch=4`** | ~4× fewer | see below |
+
+Micro-batching `> 1` had three latent `b==1` assumptions, each removed and re-proven bitwise:
+
+- **Trainer attention** asserted `b == 1`. A `[sq, b, np, hn]` micro-forward *is* a varlen batch of
+  `b` equal-length sequences — lay them out contiguously with `cu_seqlens = [0, sq, 2sq, …]`. Every
+  sequence's output at b=4 is bitwise identical to running it alone at b=1 (verified at 35B TP=8
+  head counts).
+- **The GDN chunk VJP** (`_torch_chunk_gdr_one`) hardcoded batch 1 in the initial state and output
+  reshape. The math was already batch-generic (the batch axis never reduces); use `q.shape[0]`. The
+  chunk kernel's forward at b=4 is bitwise per-sequence == b=1.
+- **The tiled expert GEMM** staged memory by `counts.max()` in its first form — memory scaling with
+  *routing skew*, which OOMed at 35B profiling (32 GiB). Fixed-capacity tiles bound it to `T + E·CAP`
+  regardless of skew (1.65 GiB) and make the tile shape a *constant*, a strictly stronger invariance
+  argument.
+
+Net: rollout **66 → ~10 min**, GPU utilization ~20% → 55–99%, step time ~3 h → ~30 min — while the
+gate stays bitwise `0.0`.
+
+> The tiled expert GEMM and the batched decode are **not** bitwise-equal to the sequential loops
+> (different kernels round differently), and do not need to be: both runtimes run the *same* new
+> function, so rollout == scoring == training numerics move together. Zero-KL requires determinism,
+> invariance to other tokens, and invariance to the padding/tile amount — all three verified — not
+> equality to the old loop.
+
+---
+
+## 12. Two metric traps
+
+Two numbers *look* like the zero-KL gate and are not. Both cost real time.
+
+**`policy_kl` is `0.0` by construction.** It is the within-trainer old-vs-new ratio at the first
+inner PPO step; with per-minibatch old-logprob recompute it is identically zero. It says nothing
+about rollout == train. Do not report it as the gate.
+
+**`minibatch_rollout_logprobs_abs_diff` is not the gate either.** It compares rollout logprobs to the
+old logprobs *recomputed per PPO minibatch*. With `train_batch_size / policy_mini_batch_size > 1`
+there are multiple minibatches, and minibatch *k>1* is recomputed **after** minibatch *k−1*'s
+optimizer step — so it legitimately measures the θ₀→θ₁ policy movement, not a numerical mismatch.
+At 35B (128/64 = 2 minibatches) it reads ~1e-2; the 0.8B (64/64 = 1 minibatch) read ~8e-7 only
+because there was no intervening step. The split is exact: every zero probe is *before* an optimizer
+step, every nonzero probe *after*.
+
+**The gate is `[ZEROKL-DIFF]` / `policy/rollout_train_logprobs_abs_diff`** — rollout vs the trainer's
+forward on the *same* weights. It prints per-token top-8 diffs with the rollout/trainer values and
+an **off-by-one check** (`d_here` vs `d_prev`/`d_next`) that distinguishes a genuine value
+divergence from a shift/alignment bug. Read it first.
+
+> **The 20-nat outlier, explained.** The 35B `minibatch_*` metric showed `max ≈ 20`. The probe's
+> off-by-one check reads `d_here=21.9 < d_prev=30.7, d_next=26.9` — alignment is correct (a shift bug
+> would make a neighbour ~0), mid-sequence, and it is a *post-optimizer* probe. It is one
+> rollout-sampled **tail token** (logprob −8.7, i.e. temperature-1.0 occasionally forcing a
+> `p≈1.6e-4` token out of a very peaked distribution) that minibatch-1's step suppressed to −30.7 in
+> a negative-advantage sequence. On *identical* weights that same token matches bitwise `0.0`; the
+> divergence is real policy movement, bounded in the loss by PPO clipping (`clip_ratio=0.0026`). Not
+> a zero-KL violation.
+
+---
+
+## 13. The recipe
 
 ```bash
 # structural
@@ -720,6 +903,22 @@ SKYRL_ZEROKL_ENABLE_PREFIX_CACHE=0 # required for GDN; safe to enable on dense/M
 SKYRL_ZEROKL_ENABLE_CHUNKED_PREFILL=0
 SKYRL_ZEROKL_ENABLE_CUDAGRAPH=0
 
+# matched TP>1 (Megatron TP == vLLM TP; both ends sharded identically)
+tensor_model_parallel_size=N       # engine builds a TP-sharded GPTModel over vLLM's worker group
+expert_tensor_parallel_size=N      # ETP == TP at EP=1 (force_zerokl_moe_config pins this)
+                                    # NCCL pins (above) now forwarded to the TRAINER actors too
+# vllm.general_plugins entry point installs the stack in every spawned mp worker
+
+# 35B-A3B efficiency (bitwise-safe; both runtimes run the same batched op)
+SKYRL_ZEROKL_MOE_BATCHED=1         # tiled bmm experts instead of the 256-iteration python loop
+SKYRL_ZEROKL_MOE_TILE_ROWS=128     # tile height (multiple of the bmm kernel's BLOCK_SIZE_M)
+SKYRL_ZEROKL_GDN_BATCHED_DECODE=1  # one conv + ragged gather instead of the per-slot loop
+SKYRL_ZEROKL_SYNC_BUCKET_MB=512    # bucket the native weight sync (20,943 params -> ~33 chunks)
+SKYRL_ZEROKL_MAX_BATCHED_TOKENS=0  # 0 => cap engine profiling at max_model_len (avoids fp32-logits OOM)
+micro_forward_batch_size_per_gpu=4 # b>1 trainer micro-forward (varlen batch; proven bitwise)
+micro_train_batch_size_per_gpu=4
+logprobs_chunk_size=256            # bound the in-place TP>1 vocab gather
+
 # also
 apply_rope_fusion=false            # the fused TE RoPE kernel is not interceptable
 tis_ratio_type=null                # TIS is unnecessary at zero KL
@@ -731,7 +930,7 @@ tis_ratio_type=null                # TIS is unnecessary at zero KL
 
 ---
 
-## 10. Results
+## 14. Results
 
 | Model | Path | Result | Log |
 |---|---|---|---|
@@ -743,10 +942,17 @@ tis_ratio_type=null                # TIS is unnecessary at zero KL
 | Qwen3.5-0.8B GDN | native vLLM, 32×2048 tok | **65 536/65 536 exact, max 0.0** (baseline 2.52%, max 0.247) | `gdn_divergence_patched.log` |
 | Qwen3.5-0.8B GDN | GPTModel-in-vLLM engine | **256/256 bitwise, max 0.0**, coherent | `gdn_gate31_hybrid.log` |
 | Qwen3.5-0.8B GDN | **live DP8 GRPO on GSM8K, 6 steps** | **`policy_kl = 0.0` every step**, abs_diff 8.06e-7 … 8.31e-7, reward 0.3555 | `zerokl_gsm8k_qwen35_0.8b.log` |
+| Qwen3.5-0.8B GDN | **live matched TP=2 GRPO, 4 steps** | **`policy_kl = 0.0`**, abs_diff 8.1e-7 … 8.3e-7 (= the TP=1 floor) | `zerokl_tp2_0.8b_r3.log` |
+| Qwen3.5-0.8B GDN | matched TP=2 engine decode vs prefill | **512/512 bitwise, max 0.0** (was max 0.16 pre gated-norm fix) | `parity_tp2_fixed.log` |
+| MiMo-7B dense | matched TP=2 engine decode vs prefill | **512/512 bitwise, max 0.0** | `parity_tp2_dense_mimo.log` |
+| Qwen3.5-35B-A3B | TP=8 engine decode vs prefill | **128/128 bitwise, max 0.0**, coherent | `parity_35b_engine.log` |
+| Qwen3.5-35B-A3B | TP=8 trainer scorer vs engine (offline) | mean 8e-7, max 3e-6 | `trainer_score_35b_tp8.log` |
+| **Qwen3.5-35B-A3B** | **live matched TP=8 GRPO on GSM8K** | **rollout == trainer bitwise `0.0` on 375,441 tokens**; reward 0.58 → 0.79 / 6 steps; rollout 66 → ~10 min | `zerokl_gsm8k_35b_tp8_r15.log` |
 
 The `~8e-7` live floor (vs the offline `0.0`) is the cross-runtime logprob-reduction floor of the
 whole pipeline, not a GDN or MoE residual: the layers themselves are bitwise. `policy_kl` is exactly
-`0.0`.
+`0.0`. **At 35B the gate is exact `0.0`**: the `[ZEROKL-DIFF]` probe reads bitwise-zero on every
+same-weight token, so the ~8e-7 floor seen at smaller scale is not even present.
 
 ### The verification suite
 
@@ -759,13 +965,15 @@ whole pipeline, not a GDN or MoE residual: the layers themselves are bitwise. `p
 | `gdn_layer_decode_parity_test.py` | full GDN layer: prefill+decode == full-sequence forward, bitwise |
 | `gdn_trainer_shim_test.py` | Megatron GDN builds w/o TE, thd fwd+bwd, forward == `gdn_ops` bitwise, q/k grads nonzero |
 | `gdn_moe_hybrid_spec_test.py` | hybrid spec keeps MoE, pins SequentialMLP, expert mapping matches |
-| `skyrl_engine_parity_test.py` | the real engine: coherent `[GEN]` **and** 256/256 bitwise |
+| `skyrl_engine_parity_test.py` | the real engine: coherent `[GEN]` **and** N/N bitwise (`PARITY_TP` for matched TP; `PARITY_DUMP` writes the rollout for the trainer scorer) |
+| `trainer_score_tp.py` | TP-matched trainer scorer over a dumped engine rollout; `ZK_BATCH` (b>1 == b=1), `ZK_GRAD` (train == eval) self-checks |
+| `moe_tp_invariance_test.py` | MoE at TP>1: a token's row is invariant to batch size and neighbours (dispatcher + ETP reduce-scatter + batched experts) |
 | `gdn_decode_prefill_divergence.py` | end-to-end decode-vs-prefill over 65 536 tokens |
 | `gdn_engine_{layer_bisect,core_probe,submodule_probe}.py` | localize the first bitwise divergence |
 
 ---
 
-## 11. The five lessons
+## 15. The lessons
 
 1. **Bitwise or nothing.** A `1e-6` tolerance hides which op is wrong. An exact-zero gate turns every
    regression into a bisectable fact — and 1 ULP amplifies into 0.3 nats over 36 layers.
@@ -788,3 +996,23 @@ whole pipeline, not a GDN or MoE residual: the layers themselves are bitwise. `p
 5. **Fail loud.** Every silent degradation in this project — the expert-bias buffer, the sleep/wake
    θ₀ restore, the mapping that matched nothing, the plugin that never loaded — cost days. Raising at
    init costs seconds.
+
+6. **Kernels selected by shape or mode are the recurring enemy.** The three hardest bugs are the same
+   bug: a kernel chosen from something other than its inputs. `torch.compile`/`jit_fuser` specializes
+   by shape (the TP=2 gated norm, §9.4); `RMSNormGated` picks its tile from the row count (§6.4);
+   the router's top-k sorts by `is_grad_enabled()` (§4.2). The engine and trainer sit on opposite
+   sides of every such switch. Grep for `@torch.compile`, `@jit_fuser`, `is_grad_enabled`,
+   autotune, and any `if training:` on the forward path — that is your bug list.
+
+7. **Batch a loop by construction, not by matching a kernel.** Every efficiency win here — tiled
+   expert `bmm`, batched GDN conv, b>1 attention — is bitwise-safe for one reason: the new
+   batch/tile axis never enters a reduction, so each item's rows are the same math as computing it
+   alone. Prove *that*, and you do not have to prove the batched kernel equals the old loop (it
+   doesn't, and needn't) — you only have to run the same function on both runtimes.
+
+8. **Read the right metric.** `policy_kl` is `0.0` by construction; `minibatch_rollout_abs_diff`
+   legitimately blows up with more than one PPO minibatch; a 20-nat outlier can be a healthy tail
+   token under an optimizer step. The gate is rollout vs trainer *on the same weights*
+   (`[ZEROKL-DIFF]`), and it comes with an off-by-one check. Misreading the metric cost a multi-hour
+   bisect of code that was already bitwise — though that bisect did harden every component and
+   produce the reusable TP-invariance harnesses.

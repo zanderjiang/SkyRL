@@ -37,7 +37,7 @@ def build_trainer_gpt(tp: int):
     from megatron.bridge import AutoBridge
     from megatron.core.transformer.enums import AttnBackend
     from transformers import AutoConfig
-    from skyrl.backends.skyrl_train.zerokl import make_zerokl_local_layer_spec
+    from skyrl.backends.skyrl_train.zerokl import make_zerokl_local_layer_spec, prepare_zerokl_moe
     from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
         maybe_force_qwen35_text_bridge,
     )
@@ -61,6 +61,7 @@ def build_trainer_gpt(tp: int):
     mp.attention_backend = AttnBackend.flash
     mp.gradient_accumulation_fusion = False
     mp.transformer_layer_spec = make_zerokl_local_layer_spec(mp)
+    prepare_zerokl_moe(mp, side='TRAINER')   # MoE recipe + deterministic ops + batched experts
     if getattr(mp, "mtp_num_layers", None):
         mp.mtp_num_layers = None
     hf = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
@@ -116,6 +117,48 @@ def main():
     from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
         _zerokl_scoring_ctx,
     )
+
+    # ZK_BATCH=N: score the SAME sequence inside an N-row micro-batch (rows 1..N-1 are other
+    # tokens), then compare row 0 to the b=1 result. The live trainer runs b=micro_batch>1 while
+    # the engine runs b=1 per request, so a b-dependent row is a zero-KL break. This is the exact
+    # cell left untested: 0.8B(no MoE) x b=4 is clean and 35B x b=1 is clean.
+    zk_batch = int(os.environ.get("ZK_BATCH", "1"))
+    if zk_batch > 1:
+        torch.manual_seed(0)
+        filler = torch.randint(0, 1000, (zk_batch - 1, L), device=dev)
+        seq_b = torch.cat([seq, filler], dim=0)
+        pos_b = pos.expand(zk_batch, L).contiguous()
+        with torch.no_grad(), _zerokl_scoring_ctx():
+            logits_b = bare(input_ids=seq_b, position_ids=pos_b, attention_mask=None)
+        with torch.no_grad(), _zerokl_scoring_ctx():
+            logits_1 = bare(input_ids=seq, position_ids=pos, attention_mask=None)
+        same = torch.equal(logits_b[0], logits_1[0])
+        d = (logits_b[0].float() - logits_1[0].float()).abs().max().item()
+        if rank == 0:
+            print(f"[B-TEST] trainer logits row0: b={zk_batch} == b=1 bitwise: {same} (maxdiff {d:.3e})",
+                  flush=True)
+            print("[B-TEST] RESULT:", "batch-invariant" if same else
+                  "NOT batch-invariant -- this is the live zero-KL break", flush=True)
+
+    # ZK_GRAD=1: reproduce the LIVE minibatch recompute -- module.train() + grad enabled. Megatron's
+    # MoE has several `self.training` / `torch.is_grad_enabled()` branches (sorted topk, expert bias,
+    # aux/z loss, layer recompute); the engine and the no-grad scoring pass take the other side of
+    # every one of them. This is the only mode the offline harness never exercised.
+    zk_grad = os.environ.get("ZK_GRAD") == "1"
+    if zk_grad:
+        bare.train()
+        with torch.enable_grad(), _zerokl_scoring_ctx():
+            logits_g = bare(input_ids=seq, position_ids=pos, attention_mask=None)
+        bare.eval()
+        with torch.no_grad(), _zerokl_scoring_ctx():
+            logits_e = bare(input_ids=seq, position_ids=pos, attention_mask=None)
+        same = torch.equal(logits_g.detach(), logits_e)
+        d = (logits_g.detach().float() - logits_e.float()).abs().max().item()
+        if rank == 0:
+            print(f"[GRAD-TEST] trainer logits train()+grad == eval()+no_grad bitwise: {same} "
+                  f"(maxdiff {d:.3e})", flush=True)
+            print("[GRAD-TEST] RESULT:", "mode-invariant" if same else
+                  "MODE-DEPENDENT -- this is the live zero-KL break", flush=True)
 
     with torch.no_grad(), _zerokl_scoring_ctx():
         logits = bare(input_ids=seq, position_ids=pos, attention_mask=None)  # [1, L, V/TP]
