@@ -531,4 +531,9 @@ def prepare_zerokl_moe(provider, *, side: str) -> bool:
     force_zerokl_moe_config(provider, side=side)
     enable_moe_deterministic_ops()
     lift_moe_tp_sp_training_veto()
+    # padded batched expert GEMMs (SKYRL_ZEROKL_MOE_BATCHED=0 restores the sequential loop);
+    # must be installed on BOTH sides -- it changes numerics vs the loop, identically for both.
+    from .moe_batched_experts import install_batched_sequential_mlp
+
+    install_batched_sequential_mlp()
     return True

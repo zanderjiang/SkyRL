@@ -71,6 +71,13 @@ from .gdn_ops import (
 # Batched decode (one conv + one ragged gather instead of a per-slot python loop) -- bitwise-equal
 # by construction (see decode()); the flag exists only for A/B against the original loop.
 _BATCHED_DECODE = os.environ.get("SKYRL_ZEROKL_GDN_BATCHED_DECODE", "1") == "1"
+# PADDED decode: run the chunk kernel over the FULL C rows of every open-chunk buffer with a
+# STATIC cu grid ([0, C, 2C, ...]) instead of ragged per-slot fills. Rows past the fill are stale
+# buffer content; PREFIX INVARIANCE (proven, gdn_chunk_prefix_invariance_test) guarantees rows
+# < fill cannot see them, and final_state is only consumed for slots whose chunk is genuinely full.
+# Costs ~2x the (cheap) GDN decode FLOPs; buys fully STATIC decode shapes -- the prerequisite for
+# CUDA-graph capture. OFF by default until the graph work lands.
+_PADDED_DECODE = os.environ.get("SKYRL_ZEROKL_GDN_PADDED_DECODE", "0") == "1"
 
 
 class ChunkConsistentGDN:
@@ -251,7 +258,27 @@ class ChunkConsistentGDN:
         cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=x.device)
         need_state = any(n == C for n in lens)
 
-        if _BATCHED_DECODE:
+        if _BATCHED_DECODE and _PADDED_DECODE:
+            # STATIC-SHAPE decode: conv + chunk over all C rows of every buffer, no ragged gather.
+            y_pad = gdn_causal_conv_batched(
+                self.x_buf[bufs], self.conv_weight, self.conv_bias,
+                initial_state=self.conv_state0[bufs], activation=self.activation,
+            )  # [N, C, D]
+            q, k, v = self._split_qkv(y_pad.reshape(N * C, -1))
+            g, beta = gdn_gate_and_beta(
+                self.a_buf[bufs].reshape(N * C, -1), self.b_buf[bufs].reshape(N * C, -1),
+                self.A_log, self.dt_bias,
+            )
+            cu_static = torch.arange(0, (N + 1) * C, C, dtype=torch.int32, device=x.device)
+            o, final_state = gdn_chunk(
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0), beta.unsqueeze(0),
+                initial_state=self.ssm_state0[bufs], output_final_state=need_state,
+                cu_seqlens=cu_static,
+            )
+            lens_dev = fills.to(self.fill.device)
+            rows = torch.arange(N, device=lens_dev.device) * C + (lens_dev - 1)
+            out = o[0, rows]                                   # row fill-1 of each slot
+        elif _BATCHED_DECODE:
             # ONE conv over all open chunks (batched over the padded buffers), then a vectorized
             # ragged gather of the valid rows in slot order. Replaces the per-slot python loop,
             # which at high concurrency dominates decode (N slots x layers python iterations per
