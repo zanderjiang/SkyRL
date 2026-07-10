@@ -68,14 +68,18 @@ NUM_GPUS=8
 
 # ----- parallelism: MATCHED TP=8 on both ends; EP=1 (ETP=8) for deterministic expert combine -----
 # Megatron TP MUST equal inference TP for zero-KL (same forward layout on trainer and rollout).
-MEGATRON_TP=4    # smallest TP that fits trainer+engine colocated (17.5+17.5 GB weights); DP=2
+# TP=8, not smaller: halving TP halves the weight shard but DOUBLES the per-rank fp32 DDP grad
+# buffer. TP=4 needs 16.3 (weights) + 32.6 (grads) + 16.3 (engine) = 65 GiB/GPU before activations
+# and KV -- it OOMs in restore_grad_buffers. TP=8 needs 32.6 GiB/GPU. Speed comes from the batched
+# expert GEMMs + micro_batch>1, not from lowering TP.
+MEGATRON_TP=8
 MEGATRON_PP=1
 MEGATRON_CP=1
 MEGATRON_EP=1     # EP=1 is required: EP>1 makes the expert combine a nondeterministic collective.
-MEGATRON_ETP=4    # experts are tensor-parallel sharded across the TP group (ETP == TP at EP=1).
+MEGATRON_ETP=8    # experts are tensor-parallel sharded across the TP group (ETP == TP at EP=1).
 
-NUM_INFERENCE_ENGINES=2
-INFERENCE_ENGINE_TP=4   # == MEGATRON_TP (matched); 2 engines generate in parallel
+NUM_INFERENCE_ENGINES=1
+INFERENCE_ENGINE_TP=8   # == MEGATRON_TP (matched)
 
 # ----- MoE determinism config (re-pinned by force_zerokl_moe_config; set here so intent is visible) -----
 MOE_TOKEN_DISPATCHER="allgather"   # at EP=1 the dispatch/combine collectives are no-ops
