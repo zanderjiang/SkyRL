@@ -188,7 +188,7 @@ uv run --isolated --extra zerokl -m skyrl.train.entrypoints.main_base \
   generator.batched=true \
   environment.env_class=gsm8k \
   generator.n_samples_per_prompt=5 \
-  generator.inference_engine.gpu_memory_utilization=0.6 \
+  generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.logger="$LOGGER" \
   trainer.project_name="${ZEROKL_WANDB_PROJECT:-gsm8k_qwen3.5}" \
   trainer.run_name="zerokl_gsm8k_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_ep${MEGATRON_EP}_etp${MEGATRON_ETP}_qwen3.5-35b-a3b" \

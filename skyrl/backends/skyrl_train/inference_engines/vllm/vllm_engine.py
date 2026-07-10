@@ -133,7 +133,13 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
                 kwargs["max_model_len"] = _mml
             _need = _mml or int(kwargs.get("max_model_len") or 0)
             if _need:
-                kwargs["max_num_batched_tokens"] = max(int(kwargs.get("max_num_batched_tokens") or 0), _need)
+                # EXACTLY max_model_len, not max(default, need): vLLM sizes its PROFILING forward by
+                # max_num_batched_tokens, and the zero-KL wrapper materializes full-vocab fp32 logits
+                # for every profile row (16384 rows x 248320 vocab = ~16 GB/rank on Qwen3.5) -- at
+                # TP=4's 17.5 GB weight shard that OOMed engine init. Short prompts still pack many
+                # per prefill within max_model_len. Overridable for long-prompt workloads.
+                kwargs["max_num_batched_tokens"] = int(
+                    os.environ.get("SKYRL_ZEROKL_MAX_BATCHED_TOKENS", "0") or 0) or _need
             kwargs["enable_chunked_prefill"] = False
             logger.info("[zerokl] forcing enable_chunked_prefill=False max_model_len=%s max_num_batched_tokens=%s",
                         kwargs.get("max_model_len"), kwargs.get("max_num_batched_tokens"))
