@@ -340,7 +340,7 @@ _matmul_invariance_lib = None
 
 
 def _install_moe_matmul_invariance() -> None:
-    """Install vLLM's Triton persistent-matmul overrides for mm/addmm/matmul/linear.
+    """Install vLLM's Triton persistent-matmul overrides on the PRIMITIVE GEMM ops (mm/addmm).
 
     On SM90+ ``enable_batch_invariant_mode`` only pins the cuBLAS workspace config, which disables
     split-K (run-to-run determinism) but does NOT make GEMMs batch-invariant: cuBLAS still selects
@@ -348,8 +348,21 @@ def _install_moe_matmul_invariance() -> None:
     The dense zero-KL GEMMs are all bf16, where cuBLAS happens to be row-invariant at our shapes
     (validated bitwise); the MoE router's fp32 gating mm is NOT (measured 4.3e-5 row drift at
     [T,2048]x[2048,64], gate-1c localization), and expert GEMMs run at per-expert token counts.
-    vLLM's own SM80 branch installs exactly these overrides; we install them for MoE processes on
-    every platform. Dense models never reach this module, so the validated dense path is untouched.
+    Dense models never reach this module, so the validated dense path is untouched.
+
+    ONLY the primitives. ``aten::matmul`` and ``aten::linear`` are CompositeImplicitAutograd: giving
+    them a CUDA kernel makes them autograd LEAVES, and torch then wants ``aten::matmul_backward`` /
+    ``aten::linear_backward``, which exist only for Meta/NestedTensor -> the training backward dies
+    with NotImplementedError. That never fired on OLMoE (whose every GEMM goes through megatron's
+    custom-autograd parallel linears) but Qwen3.5-35B-A3B's shared-expert gate calls
+    ``F.linear`` directly, and the GDN chunk VJP calls ``torch.matmul`` under grad.
+
+    Overriding mm/addmm instead loses nothing: matmul/linear DECOMPOSE into mm/addmm/bmm (bmm is
+    already overridden by ``enable_batch_invariant_mode`` on all CUDA platforms), so every GEMM
+    still lands on a Triton batch-invariant kernel, and both runtimes decompose identically ->
+    engine(no_grad) and trainer(grad) forwards stay bitwise-equal. Verified: fp32 router-GEMM row
+    is M-invariant across batch sizes; F.linear/matmul backward work at 2D and 3D, with and
+    without bias.
     """
     global _matmul_invariance_lib
     if _matmul_invariance_lib is not None:
@@ -363,11 +376,9 @@ def _install_moe_matmul_invariance() -> None:
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("aten::mm", bi.mm_batch_invariant, "CUDA")
     lib.impl("aten::addmm", bi.addmm_batch_invariant, "CUDA")
-    lib.impl("aten::matmul", bi.matmul_batch_invariant, "CUDA")
-    lib.impl("aten::linear", bi.linear_batch_invariant, "CUDA")
     _matmul_invariance_lib = lib
-    print("[ZEROKL-MOE] Triton batch-invariant matmul overrides installed (mm/addmm/matmul/linear; "
-          "cuBLAS is not M-invariant for the fp32 router GEMM on SM90)", flush=True)
+    print("[ZEROKL-MOE] Triton batch-invariant matmul overrides installed (mm/addmm only; "
+          "matmul/linear decompose onto them and must stay autograd-differentiable)", flush=True)
 
 
 def enable_moe_deterministic_ops() -> bool:
