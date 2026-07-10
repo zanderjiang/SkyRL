@@ -68,14 +68,14 @@ NUM_GPUS=8
 
 # ----- parallelism: MATCHED TP=8 on both ends; EP=1 (ETP=8) for deterministic expert combine -----
 # Megatron TP MUST equal inference TP for zero-KL (same forward layout on trainer and rollout).
-MEGATRON_TP=8
+MEGATRON_TP=4    # smallest TP that fits trainer+engine colocated (17.5+17.5 GB weights); DP=2
 MEGATRON_PP=1
 MEGATRON_CP=1
 MEGATRON_EP=1     # EP=1 is required: EP>1 makes the expert combine a nondeterministic collective.
-MEGATRON_ETP=8    # experts are tensor-parallel sharded across the TP=8 group (ETP == TP at EP=1).
+MEGATRON_ETP=4    # experts are tensor-parallel sharded across the TP group (ETP == TP at EP=1).
 
-NUM_INFERENCE_ENGINES=1
-INFERENCE_ENGINE_TP=8   # == MEGATRON_TP (matched)
+NUM_INFERENCE_ENGINES=2
+INFERENCE_ENGINE_TP=4   # == MEGATRON_TP (matched); 2 engines generate in parallel
 
 # ----- MoE determinism config (re-pinned by force_zerokl_moe_config; set here so intent is visible) -----
 MOE_TOKEN_DISPATCHER="allgather"   # at EP=1 the dispatch/combine collectives are no-ops
@@ -170,12 +170,12 @@ uv run --isolated --extra zerokl -m skyrl.train.entrypoints.main_base \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \
   trainer.eval_before_train=false \
-  trainer.eval_interval=5 \
+  trainer.eval_interval=-1 \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size=128 \
   trainer.policy_mini_batch_size=64 \
-  trainer.micro_forward_batch_size_per_gpu=1 \
-  trainer.micro_train_batch_size_per_gpu=1 \
+  trainer.micro_forward_batch_size_per_gpu=4 \
+  trainer.micro_train_batch_size_per_gpu=4 \
   trainer.ckpt_interval=10 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
