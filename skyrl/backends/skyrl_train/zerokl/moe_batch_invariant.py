@@ -472,6 +472,43 @@ def patch_olmoe_bridge_for_sequential_mlp() -> bool:
     return True
 
 
+def lift_moe_tp_sp_training_veto() -> None:
+    """Defuse Megatron's MoE + TP>1 + no-sequence-parallel TRAINING veto. Idempotent.
+
+    ``MoELayer.forward`` hard-raises "During training, performance may degrade if MoE and tensor
+    parallelism are enabled without also enabling sequence parallelism" -- by its own message a
+    PERFORMANCE footgun guard, not a correctness assert. Zero-KL REQUIRES sequence parallelism
+    off (the generator never shards the sequence axis, and the no-TE torch norm refuses SP), and
+    the batch-invariant recipe (EP=1, ETP==TP, allgather dispatcher, SequentialMLP) is exact
+    without it.
+
+    Mechanism: flip the PARENT MoELayer's ``training`` flag around the original forward -- module
+    ``training`` flags are per-module, so the router/expert children keep theirs and aux-loss /
+    router behaviour is untouched. The only other parent-flag reads in this megatron are the
+    latent-shared-expert branch (moe_shared_expert_overlap, forced off by the recipe) and
+    ``moe_layer_recompute`` gating (memory-only).
+    """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    if getattr(MoELayer, "_zerokl_sp_veto_lifted", False):
+        return
+    _orig = MoELayer.forward
+
+    def _fwd(self, *args, **kwargs):
+        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+            object.__setattr__(self, "training", False)
+            try:
+                return _orig(self, *args, **kwargs)
+            finally:
+                object.__setattr__(self, "training", True)
+        return _orig(self, *args, **kwargs)
+
+    MoELayer.forward = _fwd
+    MoELayer._zerokl_sp_veto_lifted = True
+    print("[ZEROKL-MOE] lifted MoELayer's TP-without-SP training veto (a perf guard; SP must stay "
+          "OFF for zero-KL and the EP=1/ETP==TP recipe is exact without it)", flush=True)
+
+
 def prepare_zerokl_moe(provider, *, side: str) -> bool:
     """Everything the MoE zero-KL path needs on one side. Returns True when MoE was engaged.
 
@@ -482,4 +519,5 @@ def prepare_zerokl_moe(provider, *, side: str) -> bool:
         return False
     force_zerokl_moe_config(provider, side=side)
     enable_moe_deterministic_ops()
+    lift_moe_tp_sp_training_veto()
     return True
