@@ -54,10 +54,18 @@ def _compute_distributed_log_softmax(
         shard = vocab_parallel_logits.contiguous()
         gathered = [torch.empty_like(shard) for _ in range(world)]
         torch.distributed.all_gather(gathered, shard, group=group)
+        # The CONTIGUOUS [..., V] layout is load-bearing: aten's sum reduces in a shape-dependent
+        # order, so only this layout reproduces the generator's single-row lse bitwise. Do the
+        # rest IN PLACE on `full` (never on vocab_parallel_logits, which autograd saved): the
+        # naive version held ~4 full-vocab fp32 copies and OOMed at micro_batch>1 (32 GiB at
+        # b=4, s=1536, V=248320). Peak is now 2 copies, and the caller's `chunk_size` bounds
+        # even that. Chunking the SEQ dim is exact -- each token's softmax is its own row.
         full = torch.cat(gathered, dim=-1)
+        del gathered
         logits_max = torch.amax(full, dim=-1, keepdim=True)
-        x_full = full - logits_max
-        lse = x_full.exp().sum(-1, keepdim=True).float().log()
+        full.sub_(logits_max).exp_()
+        lse = full.sum(-1, keepdim=True).float().log()
+        del full
         return (vocab_parallel_logits - logits_max) - lse.to(vocab_parallel_logits.dtype)
 
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)

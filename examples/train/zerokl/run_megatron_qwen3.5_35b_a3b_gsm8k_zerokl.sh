@@ -174,6 +174,7 @@ uv run --isolated --extra zerokl -m skyrl.train.entrypoints.main_base \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size=128 \
   trainer.policy_mini_batch_size=64 \
+  trainer.logprobs_chunk_size=256 \
   trainer.micro_forward_batch_size_per_gpu=4 \
   trainer.micro_train_batch_size_per_gpu=4 \
   trainer.ckpt_interval=10 \
