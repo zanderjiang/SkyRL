@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 _orig_sequential_forward = None
 
+# Rows per tile. A multiple of the batch-invariant bmm kernel's BLOCK_SIZE_M (128) so tiles align
+# with its row-blocks. Staged rows are bounded by T + E*CAP regardless of routing skew.
+_CAP = int(os.environ.get("SKYRL_ZEROKL_MOE_TILE_ROWS", "128"))
+
 
 def _supported(self) -> bool:
     cfg = self.config
@@ -70,30 +74,49 @@ def _batched_experts_forward(self, permuted_local_hidden_states, tokens_per_expe
     dev = x.device
     E = self.num_local_experts
     T = x.shape[0]
+    if T == 0:
+        return x.new_zeros(0, x.shape[-1]), None
 
     counts = tokens_per_expert.to(device=dev, dtype=torch.long)   # [E]
-    M = int(counts.max()) if T else 1
+
+    # FIXED-CAPACITY TILES, not pad-to-max. Padding every expert to `counts.max()` makes the
+    # staging buffer [E, max_count, h] -- memory that scales with ROUTING SKEW, not with tokens
+    # (a skewed profiling batch asked for 32 GiB and OOMed engine init). Instead cut each expert's
+    # rows into tiles of exactly CAP rows: total staged rows <= T + E*CAP, independent of skew.
+    # CAP is a CONSTANT (a multiple of the bmm kernel's BLOCK_SIZE_M=128), so a token's row is
+    # always computed by a bmm of the same shape -- which is what keeps the result invariant to
+    # how many tokens share its expert.
+    cap = _CAP
+    n_tiles_e = (counts + cap - 1) // cap                          # [E]
+    tile_cu = torch.zeros(E + 1, device=dev, dtype=torch.long)
+    tile_cu[1:] = n_tiles_e.cumsum(0)
+    n_tiles = int(tile_cu[-1])
+
+    tok_expert = torch.repeat_interleave(torch.arange(E, device=dev), counts)          # [T]
     cu = torch.zeros(E + 1, device=dev, dtype=torch.long)
     cu[1:] = counts.cumsum(0)
+    off = torch.arange(T, device=dev) - cu[:-1].repeat_interleave(counts)              # within-expert
+    tile_idx = tile_cu[:-1].repeat_interleave(counts) + off // cap                     # [T]
+    row_idx = off % cap                                                                # [T]
+    tile_expert = torch.repeat_interleave(torch.arange(E, device=dev), n_tiles_e)      # [n_tiles]
 
-    # scatter tokens (in expert order, as torch.split produced them) into the padded batch
-    idx_e = torch.repeat_interleave(torch.arange(E, device=dev), counts)          # [T]
-    idx_m = torch.arange(T, device=dev) - cu[:-1].repeat_interleave(counts)       # [T]
+    xp = x.new_zeros(n_tiles, cap, x.shape[-1])
+    xp[tile_idx, row_idx] = x
+    pp = probs.new_zeros(n_tiles, cap)
+    pp[tile_idx, row_idx] = probs
 
-    xp = x.new_zeros(E, M, x.shape[-1])
-    xp[idx_e, idx_m] = x
-    pp = probs.new_zeros(E, M)
-    pp[idx_e, idx_m] = probs
-
-    # stacked weights, in-graph for autograd
-    w1 = torch.stack([e.linear_fc1.weight for e in self.local_experts])   # [E, 2f, h]
-    w2 = torch.stack([e.linear_fc2.weight for e in self.local_experts])   # [E, h, f]
+    # stacked weights in bmm layout ([E, h, 2f] / [E, f, h], contiguous), in-graph for autograd;
+    # gathered per tile so an expert with several tiles reuses its weights.
+    w1 = torch.stack([e.linear_fc1.weight.t() for e in self.local_experts])   # [E, h, 2f]
+    w2 = torch.stack([e.linear_fc2.weight.t() for e in self.local_experts])   # [E, f, h]
+    w1g = w1[tile_expert]
+    w2g = w2[tile_expert]
 
     # torch.ops.aten.bmm, NOT torch.bmm: enable_batch_invariant_mode rebinds the PYTHON attr
     # torch.bmm to its raw Triton function, which never records autograd. Dispatching the
     # OPERATOR routes Autograd -> (overridden, batch-invariant) CUDA kernel: grads AND
     # determinism, and the backward's bmms take the same deterministic kernel.
-    inter = torch.ops.aten.bmm(xp, w1.transpose(1, 2))                    # [E, M, 2f]
+    inter = torch.ops.aten.bmm(xp, w1g)                                   # [n_tiles, cap, 2f]
 
     # the exact glu MLP.forward applies on the plain (no-TE, unfused) branch
     x_glu, x_linear = torch.chunk(inter, 2, dim=-1)
@@ -107,8 +130,8 @@ def _batched_experts_forward(self, permuted_local_hidden_states, tokens_per_expe
     inter = inter * pp.unsqueeze(-1)
     inter = inter.to(original_dtype)
 
-    out = torch.ops.aten.bmm(inter, w2.transpose(1, 2))                   # [E, M, h]
-    output_local = out[idx_e, idx_m]                                      # [T, h], expert order
+    out = torch.ops.aten.bmm(inter.contiguous(), w2g)                     # [n_tiles, cap, h]
+    output_local = out[tile_idx, row_idx]                                 # [T, h], expert order
     # explicit_expert_comm: the dispatcher owns any reduction; the sequential loop did none here.
     return output_local, None
 
