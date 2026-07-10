@@ -85,13 +85,38 @@ class TorchVarlenCoreAttn(nn.Module):
         #                             the sequence boundaries in `packed_seq_params`.
         if query.dim() == 4:
             sq, b = query.shape[0], query.shape[1]
-            assert b == 1, "TorchVarlenCoreAttn supports the b=1 micro-forward (micro_*_batch_size_per_gpu=1)"
             packed = False
         elif query.dim() == 3:
             sq, b = query.shape[0], 1
             packed = True
         else:
             raise ValueError(f"unexpected core_attention query rank {query.dim()}")
+        if not packed and b > 1:
+            # sbhd [sq, b, np, hn] -> varlen [b*sq, np, hn] with the batch's b equal-length
+            # sequences laid out CONTIGUOUSLY, plus cu_seqlens = [0, sq, 2sq, ...]. A varlen batch
+            # of b sequences is exactly what a b>1 micro-forward is; each query row still attends
+            # only within its own sequence, and num_splits=1 makes a row's reduction independent of
+            # how many sequences share the launch (asserted bitwise b=1 vs b>1 in the nightly test).
+            # This is what lets micro_*_batch_size_per_gpu > 1 (a ~4x trainer speedup at 35B).
+            q = query.permute(1, 0, 2, 3).reshape(b * sq, self.num_heads, self.head_dim).contiguous()
+            k = key.permute(1, 0, 2, 3).reshape(b * sq, self.num_kv_heads, self.head_dim).contiguous()
+            v = value.permute(1, 0, 2, 3).reshape(b * sq, self.num_kv_heads, self.head_dim).contiguous()
+            cu = torch.arange(0, (b + 1) * sq, sq, device=q.device, dtype=torch.int32)
+            if self._paged:
+                raise NotImplementedError("[zerokl] the PAGED varlen recipe assumes b == 1")
+            out = self._varlen_attn(
+                q, k, v, cu, cu, sq, sq,
+                scale=self.scale, num_splits=1, enable_gqa=self.enable_gqa, window_size=(-1, 0),
+            ) if not self._use_out else self._varlen_attn_out(
+                torch.empty_like(q), q, k, v, cu, cu, sq, sq,
+                scale=self.scale, num_splits=1, enable_gqa=self.enable_gqa, window_size=(-1, 0),
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            hp = self.num_heads * self.head_dim
+            # [b*sq, np, hn] -> [b, sq, hp] -> sbhd [sq, b, hp]
+            return out.reshape(b, sq, hp).permute(1, 0, 2).contiguous()
+
         q = query.reshape(sq, self.num_heads, self.head_dim)
         k = key.reshape(sq, self.num_kv_heads, self.head_dim)
         v = value.reshape(sq, self.num_kv_heads, self.head_dim)
