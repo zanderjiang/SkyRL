@@ -223,7 +223,11 @@ def _gdn_chunk_fwd(q, k, v, g, beta, initial_state, output_final_state, cu_seqle
 
 
 def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
-    """Differentiable fp32 chunked delta rule for ONE sequence. q..beta: ``[1, T, H, D]``.
+    """Differentiable fp32 chunked delta rule for a batch of equal-length sequences.
+
+    ``q..beta``: ``[B, T, H, D]``. B>1 is the micro_*_batch_size_per_gpu>1 trainer micro-forward;
+    every sequence is advanced independently (the batch dim never enters a reduction), so row
+    values match B=1 exactly.
 
     This is the HuggingFace / megatron ``torch_chunk_gated_delta_rule`` reference, unchanged except
     that it takes ``initial_state`` in the kernel's ``[N, H, V, K]`` layout. It exists only to supply
@@ -260,7 +264,7 @@ def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
     u = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     if initial_state is None:
-        state = q.new_zeros(1, num_heads, k_dim, v_dim)
+        state = q.new_zeros(q.shape[0], num_heads, k_dim, v_dim)
     else:
         state = initial_state.transpose(-1, -2).float()  # [N,H,V,K] -> [N,H,K,V]
 
@@ -275,8 +279,8 @@ def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
             k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]
         ).transpose(-1, -2) @ v_new
 
-    o = torch.stack(outs, dim=2).reshape(1, num_heads, Tp, v_dim)[:, :, :T]
-    return o.transpose(1, 2)  # [1, T, H, V]
+    o = torch.stack(outs, dim=2).reshape(q.shape[0], num_heads, Tp, v_dim)[:, :, :T]
+    return o.transpose(1, 2)  # [B, T, H, V]
 
 
 def _torch_chunk_gdr(q, k, v, g, beta, initial_state, cu_seqlens, chunk_size):
