@@ -18,19 +18,12 @@ def _unwrap_model(model):
 
 
 def _resolve_mtp_host(model):
-    """Return the submodule that owns the native MTP block (``.mtp``).
-
-    Usually the model itself, but for VL wrappers (e.g. Qwen3.5-VL) the MTP head is nested at
-    ``model.language_model``. Descend the ``.language_model`` chain until we find a module with ``.mtp``;
-    if none, return the model unchanged (capture then yields ``None``)."""
-    seen = set()
-    cur = model
-    for _ in range(4):  # bounded descent guard against pathological nesting / cycles
-        if cur is None or id(cur) in seen:
-            break
-        seen.add(id(cur))
+    """Return the submodule that owns the native MTP block (``.mtp``)."""
+    cur, seen = model, set()
+    while cur is not None and id(cur) not in seen:
         if getattr(cur, "mtp", None) is not None:
             return cur
+        seen.add(id(cur))
         cur = getattr(cur, "language_model", None)
     return model
 
