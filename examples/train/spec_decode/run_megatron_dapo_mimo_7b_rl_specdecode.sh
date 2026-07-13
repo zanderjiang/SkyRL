@@ -2,12 +2,11 @@ set -x
 
 # Colocated DAPO training+generation for XiaomiMiMo/MiMo-7B-RL (dense) on DAPO data with Megatron,
 # with native Multi-Token Prediction (MTP) speculative decoding for faster rollout. Runs on 1x8 H100.
-# DATA_DIR=/mnt/local_storage/data/dapo bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+# bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # bash examples/train/spec_decode/run_megatron_dapo_mimo_7b_rl_specdecode.sh
 
 MODEL_NAME="XiaomiMiMo/MiMo-7B-RL"
-# Use the fast, non-persistent local disk for data (not the ~/default quota).
-DATA_DIR="/mnt/local_storage/data/dapo"
+DATA_DIR="$HOME/data/dapo"
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
 NUM_NODES=1
@@ -90,8 +89,6 @@ MTP_LOSS_TOPK=256
 # special vLLM prefill backend is needed.
 REMOVE_MICROBATCH_PADDING=true
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
-# New inference server path: MTP speculative decoding (drafter weight-sync + acceptance metrics via
-# the vLLM Prometheus scraper) is supported here.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
@@ -165,9 +162,9 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.logger="$LOGGER" \
   trainer.project_name="mimo_7b_rl_dapo" \
   trainer.run_name="sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
-  trainer.export_path="/mnt/local_storage/exports/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.export_path="$HOME/exports/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   trainer.hf_save_interval=300 \
   trainer.resume_mode=latest \
   trainer.max_ckpts_to_keep=3 \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.ckpt_path="$HOME/ckpts/sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   $@

@@ -13,14 +13,12 @@ set -x
 #
 # Runs on 1 node of 8xH100s (80GB each).
 #
-# Prepare data onto the fast local disk first:
-#   DATA_DIR=/mnt/local_storage/data/dapo bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+#   bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # Then launch:
 #   bash examples/train/megatron/run_megatron_dapo_mimo_7b_rl.sh
 
 MODEL_NAME="XiaomiMiMo/MiMo-7B-RL"
-# Use the fast, non-persistent local disk for data (not the ~/default quota).
-DATA_DIR="/mnt/local_storage/data/dapo"
+DATA_DIR="$HOME/data/dapo"
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
 NUM_NODES=1
@@ -155,10 +153,10 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.logger="$LOGGER" \
   trainer.project_name="mimo_7b_rl_dapo" \
-  trainer.run_name="nosd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
-  trainer.export_path="/mnt/local_storage/exports/dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.run_name="dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.export_path="$HOME/exports/dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   trainer.hf_save_interval=300 \
   trainer.resume_mode=latest \
   trainer.max_ckpts_to_keep=3 \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.ckpt_path="$HOME/ckpts/dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   $@

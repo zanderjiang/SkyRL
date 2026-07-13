@@ -2,19 +2,18 @@ set -x
 
 # Colocated DAPO training+generation for Qwen3.5-9B (dense) on DAPO data with Megatron,
 # with Multi-Token Prediction (MTP) speculative decoding for faster rollout. Runs on 1x8 H100.
-# DATA_DIR=/mnt/local_storage/data/dapo bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+# bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # bash examples/train/spec_decode/run_megatron_dapo_qwen3.5_9b_specdecode.sh
 
 MODEL_NAME="Qwen/Qwen3.5-9B"
-# Use the fast, non-persistent local disk for data (not the ~/default quota).
-DATA_DIR="/mnt/local_storage/data/dapo"
+DATA_DIR="$HOME/data/dapo"
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
 NUM_NODES=1
 NUM_GPUS_PER_NODE=8
-# 9B is ~4.5x the 2B: a single full-weight copy is ~18GB in bf16. Use inference
-# TP=2 (4 engines) so each engine's weights are halved (~9GB/GPU) and there is
-# more headroom for KV cache during generation. TP=2 comm stays on NVLink.
+# One engine per GPU (TP=1): a single Qwen3.5-9B copy is ~18GB in bf16, which fits per
+# engine alongside the KV cache and the small MTP drafter at gpu_memory_utilization=0.5
+# (the policy is offloaded during generation under colocate_all).
 NUM_INFERENCE_ENGINES=8
 INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=1
 LOGGER="wandb"  # change to "console" to print to stdout
@@ -47,8 +46,8 @@ ENFORCE_EAGER=true # cuda graphs can cause some instability
 LR=1e-6
 
 # megatron config -- Qwen3.5-9B is a dense model, so no expert parallelism.
-# TP=4 (up from 2 on the 2B): 9B params + Adam states + 8K-token activations
-# need more sharding to fit at micro batch 1. TP>1 auto-enables sequence
+# TP=4: 9B params + Adam states + 8K-token activations need this much sharding
+# to fit at micro batch 1. TP>1 auto-enables sequence
 # parallelism, sharding activations/vocab-logits across the TP group.
 # TP=4, PP=1, CP=1 => DP=2. TP stays within the single-node NVLink domain.
 MEGATRON_TP=4
@@ -87,8 +86,6 @@ MTP_LOSS_TOPK=256
 REMOVE_MICROBATCH_PADDING=false # sample packing is not yet supported for GDN layers in megatron - see: https://github.com/NVIDIA/Megatron-LM/pull/2644
 ENGINE_INIT_KWARGS='{"gdn_prefill_backend": "triton"}' # see https://github.com/vllm-project/vllm/issues/36921#issuecomment-4109702738
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
-# New inference server path: MTP speculative decoding (drafter weight-sync + acceptance metrics via
-# the vLLM Prometheus scraper) is supported here.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
@@ -161,11 +158,11 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \
   trainer.policy.megatron_config.mtp_loss_topk=$MTP_LOSS_TOPK \
   trainer.logger="$LOGGER" \
-  trainer.project_name="qwen3_5_dapo_2" \
+  trainer.project_name="qwen3_5_9b_dapo" \
   trainer.run_name="sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
-  trainer.export_path="/mnt/local_storage/exports/sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.export_path="$HOME/exports/sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   trainer.hf_save_interval=300 \
   trainer.resume_mode=latest \
   trainer.max_ckpts_to_keep=3 \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.ckpt_path="$HOME/ckpts/sd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   $@

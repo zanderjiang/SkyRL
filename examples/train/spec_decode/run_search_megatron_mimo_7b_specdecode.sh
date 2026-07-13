@@ -5,7 +5,7 @@ set -x
 #
 # Setup (see examples/train/search/README.md):
 #   1. Dataset parquet:
-#        uv run --isolated examples/train/search/searchr1_dataset.py --local_dir /mnt/local_storage/data/searchR1
+#        uv run --isolated examples/train/search/searchr1_dataset.py --local_dir $HOME/data/searchR1
 #   2. Download the wiki-18 e5 index + corpus into the same dir, assemble e5_Flat.index, gunzip corpus.
 #   3. Start the local e5 retrieval server (separate faiss-gpu conda env) on :8000.
 #   export WANDB_API_KEY=<your_key_here>
@@ -13,7 +13,7 @@ set -x
 
 MODEL_NAME="XiaomiMiMo/MiMo-7B-RL"
 # Dataset on the fast, non-persistent local disk (not the ~/default quota).
-DATA_DIR="/mnt/local_storage/data/searchR1"
+DATA_DIR="$HOME/data/searchR1"
 
 NUM_NODES=1
 NUM_GPUS_PER_NODE=8
@@ -53,8 +53,6 @@ MTP_LOSS_TOPK=256         # top-k draft loss: O(seq*k) memory vs O(seq*vocab)
 REMOVE_MICROBATCH_PADDING=true
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
 ENFORCE_EAGER=true  # cuda graphs can cause instability with weight sync
-# New inference server path: MTP speculative decoding (drafter weight-sync + acceptance metrics via
-# the vLLM Prometheus scraper) is supported here.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 RUN_NAME="sd_search_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_k${MTP_NUM_SPECULATIVE_TOKENS}"
@@ -129,12 +127,12 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.hf_save_interval=100 \
   trainer.max_ckpts_to_keep=3 \
   trainer.resume_mode=latest \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/${RUN_NAME}" \
+  trainer.ckpt_path="$HOME/ckpts/${RUN_NAME}" \
   trainer.eval_batch_size=256 \
   trainer.eval_before_train=false \
   trainer.eval_interval=50 \
   generator.eval_sampling_params.temperature=0 \
   generator.eval_sampling_params.stop='["</search>", "</answer>"]' \
   generator.eval_sampling_params.max_generate_length=500 \
-  trainer.export_path="/mnt/local_storage/exports/${RUN_NAME}" \
+  trainer.export_path="$HOME/exports/${RUN_NAME}" \
   $@

@@ -6,14 +6,12 @@ set -x
 # NOTE: verify the exact HF repo id for the 9B model before running
 #   (e.g. `hf download Qwen/Qwen3.5-9B` / check https://huggingface.co/Qwen).
 #
-# Prepare data onto the fast local disk first:
-#   DATA_DIR=/mnt/local_storage/data/dapo bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+#   bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # Then launch:
 #   bash examples/train/megatron/run_megatron_dapo_qwen3.5_9b.sh
 
 MODEL_NAME="Qwen/Qwen3.5-9B"
-# Use the fast, non-persistent local disk for data (not the ~/default quota).
-DATA_DIR="/mnt/local_storage/data/dapo"
+DATA_DIR="$HOME/data/dapo"
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
 NUM_NODES=1
@@ -53,8 +51,8 @@ ENFORCE_EAGER=true # cuda graphs can cause some instability
 LR=1e-6
 
 # megatron config -- Qwen3.5-9B is a dense model, so no expert parallelism.
-# TP=4 (up from 2 on the 2B): 9B params + Adam states + 8K-token activations
-# need more sharding to fit at micro batch 1. TP>1 auto-enables sequence
+# TP=4: 9B params + Adam states + 8K-token activations need this much sharding
+# to fit at micro batch 1. TP>1 auto-enables sequence
 # parallelism, sharding activations/vocab-logits across the TP group.
 # TP=4, PP=1, CP=1 => DP=2. TP stays within the single-node NVLink domain.
 MEGATRON_TP=4
@@ -145,11 +143,11 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.eval_n_samples_per_prompt=$EVAL_N_SAMPLES_PER_PROMPT \
   generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.logger="$LOGGER" \
-  trainer.project_name="qwen3_5_dapo_2" \
-  trainer.run_name="nosd_dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
-  trainer.export_path="/mnt/local_storage/exports/dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.project_name="qwen3_5_9b_dapo" \
+  trainer.run_name="dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.export_path="$HOME/exports/dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   trainer.hf_save_interval=300 \
   trainer.resume_mode=latest \
   trainer.max_ckpts_to_keep=3 \
-  trainer.ckpt_path="/mnt/local_storage/ckpts/dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
+  trainer.ckpt_path="$HOME/ckpts/dapo_qwen3_5_9b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \
   $@
