@@ -35,14 +35,17 @@ def _mtp_layer_offset(mtp_block) -> int:
     (the trunk hidden states plus any MTP outputs forwarded from earlier pipeline/VP stages),
     appends one new chunk per MTP depth, and concatenates everything along dim 0. ``offset`` is 0 in
     the common single-stage case; we resolve it via megatron-core so the replay split below is also
-    correct under PP/VPP. Falls back to 0 only if the helper is missing (older megatron-core); other
-    errors propagate rather than silently returning 0 and mis-splitting the hidden states."""
+    correct under PP/VPP. Fails loud if the helper is missing (megatron-core moved it) -- a silent 0
+    would mis-split the hidden states under PP/VPP."""
     try:
         from megatron.core.transformer.multi_token_prediction import (
             get_mtp_layer_offset,
         )
-    except ImportError:
-        return 0
+    except ImportError as e:
+        raise RuntimeError(
+            "megatron-core no longer exposes get_mtp_layer_offset; the MTP replay chunk split "
+            "cannot be resolved under PP/VPP. Update mtp/hidden_capture.py."
+        ) from e
     return int(get_mtp_layer_offset(mtp_block.config, getattr(mtp_block, "vp_stage", None)))
 
 
@@ -90,7 +93,16 @@ class MTPHiddenCapture:
         self._kwargs = None
         # Run the MTP block in eval mode (forward + replay): Megatron's full-recompute path routes
         # through CheckpointFunction, which can't save the non-tensor PackedSeqParams for backward.
-        # Eval skips it (dropout is 0 here; gradients still flow) and MTP is one tiny layer.
+        # Eval skips it (gradients still flow) and MTP is one tiny layer. Correct ONLY while the
+        # head has no dropout -- eval would silently drop it from training otherwise.
+        mtp_config = getattr(mtp, "config", None)
+        for attr in ("hidden_dropout", "attention_dropout"):
+            dropout = getattr(mtp_config, attr, 0) or 0
+            assert dropout == 0, (
+                f"MTP capture runs the MTP block in eval mode (recompute/PackedSeqParams "
+                f"workaround), which would silently disable {attr}={dropout}. Set it to 0 or "
+                "rework the capture."
+            )
         self._prev_training = mtp.training
         mtp.eval()
         self._handles.append(mtp.register_forward_pre_hook(self._pre_hook, with_kwargs=True))

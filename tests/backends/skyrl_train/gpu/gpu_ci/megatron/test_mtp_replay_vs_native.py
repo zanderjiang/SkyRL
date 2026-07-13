@@ -44,7 +44,6 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
     def probe_replay_vs_native(self, token_ids=None, seq_len: int = 96) -> dict:
-        import torch
         from megatron.core.utils import unwrap_model
 
         from skyrl.backends.skyrl_train.mtp.adapter import project_mtp_hidden_to_logits
@@ -173,7 +172,6 @@ def _cfg():
     cfg.trainer.policy.megatron_config.context_parallel_size = 1
     cfg.trainer.mtp.enabled = True
     cfg.trainer.mtp.num_speculative_tokens = 1
-    cfg.trainer.mtp.loss_type = "soft_ce"
     validate_cfg(cfg)
     return cfg
 

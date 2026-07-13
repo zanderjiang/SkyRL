@@ -465,8 +465,8 @@ class MegatronWorker:
             disable_native_mtp_loss()
             logger.info(
                 f"MTP enabled (decoupled): mtp_num_layers={provider.mtp_num_layers}, "
-                f"mtp_loss_type={megatron_config.mtp_loss_type}, "
                 f"mtp_loss_weight={megatron_config.mtp_loss_weight}, "
+                f"mtp_loss_topk={megatron_config.mtp_loss_topk}, "
                 f"mtp_detach_trunk={megatron_config.mtp_detach_trunk} "
                 "(native process_mtp_loss disabled)"
             )

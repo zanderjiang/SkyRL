@@ -28,7 +28,6 @@ from skyrl.backends.skyrl_train.mtp.adapter import project_mtp_hidden_to_logits
 from skyrl.backends.skyrl_train.mtp.hidden_capture import maybe_capture_mtp_hidden
 from skyrl.backends.skyrl_train.mtp.soft_ce import (
     build_teacher_logits,
-    draft_hard_ce,
     draft_soft_ce,
     draft_soft_ce_topk,
     shift_mask_for_mtp,
@@ -42,10 +41,7 @@ from skyrl.backends.skyrl_train.utils.replay_utils import (
     setup_per_microbatch_replay_backward,
     setup_per_microbatch_replay_forward,
 )
-from skyrl.backends.skyrl_train.utils.torch_utils import (
-    build_mtp_next_token_labels,
-    masked_mean,
-)
+from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     compute_minibatch_rollout_logprob_diff_metrics,
 )
@@ -357,13 +353,14 @@ class MegatronModelWrapper:
         # (trunk input optionally detached) for us to score. Training only.
         model_config = get_model_config(self.actor_module[0])
         mtp_enabled = (not forward_only) and bool(getattr(model_config, "mtp_num_layers", None))
+        # Defaults live on the MegatronConfig dataclass (config.py) -- read the fields directly
+        # rather than restating them in getattr fallbacks that could drift.
         mcfg = self.cfg.policy.megatron_config
-        mtp_loss_type = getattr(mcfg, "mtp_loss_type", "soft_ce")
-        mtp_loss_weight = float(getattr(mcfg, "mtp_loss_weight", 0.1))
-        mtp_detach_trunk = bool(getattr(mcfg, "mtp_detach_trunk", True))
-        mtp_detach_shared_output = bool(getattr(mcfg, "mtp_detach_shared_output", True))
-        mtp_loss_chunk_size = getattr(mcfg, "mtp_loss_chunk_size", 1024)
-        mtp_loss_topk = getattr(mcfg, "mtp_loss_topk", None)
+        mtp_loss_weight = float(mcfg.mtp_loss_weight)
+        mtp_detach_trunk = bool(mcfg.mtp_detach_trunk)
+        mtp_detach_shared_output = bool(mcfg.mtp_detach_shared_output)
+        mtp_loss_chunk_size = mcfg.mtp_loss_chunk_size
+        mtp_loss_topk = mcfg.mtp_loss_topk
 
         if mtp_enabled:
             # The decoupled draft training records the MTP block's inputs with a forward pre-hook
@@ -474,9 +471,10 @@ class MegatronModelWrapper:
                 rollout_logprobs=rollout_action_logprobs,
             )
 
-            # Decoupled MTP / draft loss: score the detached-input MTP head against the policy's own
-            # next-token distribution (soft CE) or the ground-truth future tokens (hard CE). The local
-            # masked-mean scalar is folded into the loss below like the KL/entropy aux terms.
+            # Decoupled MTP / draft loss: soft-CE distillation of the detached-input MTP head against
+            # the policy's own next-token distribution (full-vocab, or top-k when mtp_loss_topk is
+            # set). The local masked-mean scalar is folded into the loss below like the KL/entropy
+            # aux terms.
             draft_loss = None
             student_logits_list = data.get("mtp_student_logits")
             if mtp_enabled and student_logits_list:
@@ -492,63 +490,43 @@ class MegatronModelWrapper:
                 teacher_src = logits if temperature == 1.0 else logits * temperature
                 # Megatron may pad the vocab to divide across TP; padded rows are never trained, so slice
                 # this rank's shard to its true width to keep them out of the teacher (a view; autograd
-                # zero-fills the tail). hard CE's vocab_start_index keeps the padded (global) stride.
+                # zero-fills the tail).
                 true_shard_width = unpadded_vocab_shard_width(
                     getattr(model_config, "vocab_size", None), vocab_size_tp, tp_rank
                 )
                 if true_shard_width != vocab_size_tp:
                     teacher_src = teacher_src[..., :true_shard_width]
-                # Packed: build labels from packed_targets ([1, T]) so they align with the packed
-                # student/teacher; the global roll's cross-segment entries are zeroed by layer_mask.
-                hard_label_src = data["packed_targets"] if packed else sequences
-                hard_labels = build_mtp_next_token_labels(hard_label_src) if mtp_loss_type == "hard_ce" else None
 
                 per_layer_losses = []
                 for layer_idx, student_logits in enumerate(student_logits_list):
                     if true_shard_width != vocab_size_tp:
                         student_logits = student_logits[..., :true_shard_width]
-                    # Hard CE's target (token seq[t+k+2]) is one position past the soft-CE teacher
-                    # (a distribution at t+k+1), so its validity mask needs one extra shift.
-                    mask_shift = layer_idx + 1 if mtp_loss_type == "hard_ce" else layer_idx
-                    layer_mask = shift_mask_for_mtp(draft_mask, mask_shift, cu_seqlens=mtp_cu_seqlens)
-                    if mtp_loss_type == "hard_ce":
-                        layer_labels = torch.roll(hard_labels, shifts=-(layer_idx + 1), dims=1)
+                    layer_mask = shift_mask_for_mtp(draft_mask, layer_idx, cu_seqlens=mtp_cu_seqlens)
+                    if mtp_loss_topk:
+                        # Top-k draft loss: O(seq*k) memory, no full-vocab softmax. Pass the un-rolled
+                        # policy logits + roll_shift so top-k runs on them directly and only the small
+                        # [B, S, k] result is rolled (avoids a full rolled-teacher copy).
                         per_layer_losses.append(
-                            draft_hard_ce(
+                            draft_soft_ce_topk(
                                 student_logits,
-                                layer_labels,
+                                teacher_src,
                                 layer_mask,
+                                k=mtp_loss_topk,
                                 vocab_parallel_group=tp_grp,
-                                vocab_start_index=tp_rank * vocab_size_tp,
-                                chunk_size=mtp_loss_chunk_size,
+                                roll_shift=layer_idx + 1,
                             )
                         )
                     else:
-                        if mtp_loss_topk:
-                            # Top-k draft loss: O(seq*k) memory, no full-vocab softmax. Pass the un-rolled
-                            # policy logits + roll_shift so top-k runs on them directly and only the small
-                            # [B, S, k] result is rolled (avoids a full rolled-teacher copy).
-                            per_layer_losses.append(
-                                draft_soft_ce_topk(
-                                    student_logits,
-                                    teacher_src,
-                                    layer_mask,
-                                    k=mtp_loss_topk,
-                                    vocab_parallel_group=tp_grp,
-                                    roll_shift=layer_idx + 1,
-                                )
+                        teacher_logits = build_teacher_logits(teacher_src, layer_idx, detach=True)
+                        per_layer_losses.append(
+                            draft_soft_ce(
+                                student_logits,
+                                teacher_logits,
+                                layer_mask,
+                                vocab_parallel_group=tp_grp,
+                                chunk_size=mtp_loss_chunk_size,
                             )
-                        else:
-                            teacher_logits = build_teacher_logits(teacher_src, layer_idx, detach=True)
-                            per_layer_losses.append(
-                                draft_soft_ce(
-                                    student_logits,
-                                    teacher_logits,
-                                    layer_mask,
-                                    vocab_parallel_group=tp_grp,
-                                    chunk_size=mtp_loss_chunk_size,
-                                )
-                            )
+                        )
                 draft_loss = torch.stack(per_layer_losses).mean()
                 # Drop the dict's reference so the tensor is freed after this microbatch's backward
                 # (the autograd graph still holds it until then) instead of lingering.

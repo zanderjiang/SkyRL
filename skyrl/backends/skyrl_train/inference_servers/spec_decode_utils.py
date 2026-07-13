@@ -16,9 +16,16 @@ full weight list is safe to pass. No-op when speculative decoding is disabled (n
 drafter) or the drafter has no loadable model (e.g. ngram).
 """
 
+import logging
 from typing import Iterable, List, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# One-shot flags so the per-sync outcome is logged once, not every chunk of every sync.
+_logged_reload = False
+_logged_noop = False
 
 
 def _reload_spec_decode_drafter(model_runner, weight_list: List[Tuple[str, torch.Tensor]]) -> bool:
@@ -32,11 +39,33 @@ def _reload_spec_decode_drafter(model_runner, weight_list: List[Tuple[str, torch
     Returns:
         True if a drafter model was reloaded, False if there was nothing to reload.
     """
+    global _logged_reload, _logged_noop
     drafter = getattr(model_runner, "drafter", None)
     drafter_model = getattr(drafter, "model", None)
     if drafter_model is None or not hasattr(drafter_model, "load_weights"):
-        # No spec decoding, or a drafter without a weight-loadable model (e.g. ngram).
+        spec_cfg = getattr(model_runner, "speculative_config", None)
+        if spec_cfg is not None and drafter is None:
+            # vLLM sets model_runner.drafter whenever speculative decoding is on (last PP
+            # rank). Reaching here means the attribute chain broke (vLLM rename?) -- the
+            # drafter would silently draft with stale weights, so warn EVERY sync.
+            logger.warning(
+                "Speculative decoding is enabled (%s) but model_runner.drafter was not found; "
+                "the drafter is NOT being weight-synced and will go stale. vLLM's drafter "
+                "attribute layout likely changed -- update spec_decode_utils.py.",
+                getattr(spec_cfg, "method", spec_cfg),
+            )
+        elif not _logged_noop:
+            reason = (
+                "speculative decoding disabled"
+                if spec_cfg is None
+                else f"proposer ({type(drafter).__name__}) has no weight-loadable model"
+            )
+            logger.info("Spec-decode drafter reload: nothing to reload (%s).", reason)
+            _logged_noop = True
         return False
     weights: Iterable[Tuple[str, torch.Tensor]] = iter(weight_list)
     drafter_model.load_weights(weights)
+    if not _logged_reload:
+        logger.info("Spec-decode drafter (%s) reloaded from synced weights.", type(drafter_model).__name__)
+        _logged_reload = True
     return True

@@ -12,17 +12,22 @@ uv run --isolated --extra dev pytest tests/backends/skyrl_train/mtp/test_hidden_
 import sys
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
-# Stub out megatron.core.utils.unwrap_model so hidden_capture imports on CPU.
-# (hidden_capture also tries megatron.core.transformer.multi_token_prediction.get_mtp_layer_offset,
-# which is absent here, so it falls back to offset 0 — the single-stage / no-PP case.)
+# Stub out the megatron pieces hidden_capture touches so it runs on CPU:
+# unwrap_model (a passthrough) and get_mtp_layer_offset (0 — the single-stage / no-PP case;
+# hidden_capture fails loud if the real helper goes missing, so the stub must provide it).
 _fake_mcore_utils = types.ModuleType("megatron.core.utils")
 _fake_mcore_utils.unwrap_model = lambda m: m
+_fake_mtp_mod = types.ModuleType("megatron.core.transformer.multi_token_prediction")
+_fake_mtp_mod.get_mtp_layer_offset = lambda config, vp_stage=None: 0
 sys.modules.setdefault("megatron", types.ModuleType("megatron"))
 sys.modules.setdefault("megatron.core", types.ModuleType("megatron.core"))
+sys.modules.setdefault("megatron.core.transformer", types.ModuleType("megatron.core.transformer"))
 sys.modules["megatron.core.utils"] = _fake_mcore_utils
+sys.modules["megatron.core.transformer.multi_token_prediction"] = _fake_mtp_mod
 
 from skyrl.backends.skyrl_train.mtp.adapter import (  # noqa: E402
     project_mtp_hidden_to_logits,
@@ -36,6 +41,9 @@ class _FakeMTPBlock(nn.Module):
     def __init__(self, hidden, num_layers=1):
         super().__init__()
         self.num_layers = num_layers
+        # Real MTP blocks (MegatronModule) always carry .config; the capture reads its dropout
+        # fields (eval-mode guard) and _mtp_layer_offset passes it to get_mtp_layer_offset.
+        self.config = types.SimpleNamespace(mtp_num_layers=num_layers, hidden_dropout=0.0, attention_dropout=0.0)
         # One distinct weight per MTP depth so each depth's output is separable.
         self.w = nn.ParameterList([nn.Parameter(torch.ones(hidden) * (i + 1)) for i in range(num_layers)])
 
@@ -82,6 +90,17 @@ def _run(detach_trunk, model_cls=_FakeGPT, mtp_num_layers=1):
         _ = model.mtp(hidden_states=trunk, position_ids=torch.zeros(b, s))
     student = capture.compute_student_hidden_states()
     return model, trunk, student
+
+
+def test_capture_rejects_dropout_on_mtp_block():
+    # capture() forces the MTP block into eval mode (recompute/PackedSeqParams workaround),
+    # which would silently disable dropout -- must fail loud instead.
+    model = _FakeGPT()
+    model.mtp.config.hidden_dropout = 0.1
+    capture = MTPHiddenCapture(model)
+    with pytest.raises(AssertionError, match="hidden_dropout"):
+        with capture.capture():
+            pass
 
 
 def test_capture_returns_one_chunk_per_mtp_depth():

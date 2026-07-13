@@ -114,12 +114,10 @@ def _make_policy_cfg(model_name: str) -> SkyRLTrainConfig:
     # directly is clobbered back to 0/None by _apply_mtp_config when trainer.mtp.enabled is False).
     cfg.trainer.mtp.enabled = True
     cfg.trainer.mtp.num_speculative_tokens = 1
-    cfg.trainer.mtp.loss_type = "soft_ce"
     cfg.trainer.mtp.loss_weight = 0.1
     validate_cfg(cfg)
     assert cfg.trainer.policy.megatron_config.mtp_num_layers == 1, (
-        f"expected mtp_num_layers=1 after validate_cfg, got "
-        f"{cfg.trainer.policy.megatron_config.mtp_num_layers}"
+        f"expected mtp_num_layers=1 after validate_cfg, got " f"{cfg.trainer.policy.megatron_config.mtp_num_layers}"
     )
     return cfg
 
@@ -173,9 +171,7 @@ def test_mtp_head_weights_roundtrip(ray_init_fixture):
             num_gpus_per_node=1,
             cfg=cfg,
         )
-        probes = ray.get(
-            policy.async_run_ray_method("pass_through", "probe_export_mtp_weights")
-        )
+        probes = ray.get(policy.async_run_ray_method("pass_through", "probe_export_mtp_weights"))
     finally:
         _megatron_worker_mod.PolicyWorker = _orig
 

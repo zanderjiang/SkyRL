@@ -243,7 +243,6 @@ def _apply_mtp_config(cfg: SkyRLTrainConfig):
         )
     # Leave mcfg.mtp_num_layers untouched (None => megatron-bridge infers the head count from the
     # model's HF config; MegatronWorker fails loud if it resolves to zero while MTP is enabled).
-    mcfg.mtp_loss_type = mtp.loss_type
     mcfg.mtp_loss_weight = mtp.loss_weight
 
     # SKYRL_DISABLE_SPEC=1: keep MTP head training on but leave vLLM rollout plain autoregressive.

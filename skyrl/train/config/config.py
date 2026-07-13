@@ -230,9 +230,6 @@ class MegatronConfig(BaseConfig):
     """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``. The draft loss trains the
     MTP heads on *detached* trunk hidden states, so it never pulls on the policy backbone. Only used
     when MTP heads are active."""
-    mtp_loss_type: str = "soft_ce"
-    """Draft-head supervision: ``"soft_ce"`` distills against the policy's own detached, rolled
-    next-token distribution; ``"hard_ce"`` is standard next-token cross-entropy."""
     mtp_detach_trunk: bool = True
     """Detach the trunk hidden states feeding the MTP head so only the head's parameters get the draft
     gradient. If False, the gradient flows back into the policy backbone (Megatron's coupled MTP)."""
@@ -257,8 +254,8 @@ class MegatronConfig(BaseConfig):
     mtp_loss_topk: Optional[int] = None
     """If set, use a top-k approximation of the soft-CE draft loss: distill only the teacher's top-k
     tokens (renormalized), ``O(seq*k)`` memory instead of ``O(seq*vocab)`` -- fits at large vocab
-    without fragmentation. Reconciled across the TP group, so it scales to any parallel size. Soft-CE
-    only; ``None`` uses the exact full-vocab loss. Typical: 64-128."""
+    without fragmentation. Reconciled across the TP group, so it scales to any parallel size.
+    ``None`` uses the exact full-vocab loss. Typical: 64-128."""
 
     def __post_init__(self):
         # Backfill defaults for any keys the user didn't override so an override dict
@@ -768,8 +765,6 @@ class MTPConfig(BaseConfig):
     """Draft depth vLLM speculates per step, independent of the trained head count. Single-head
     checkpoints (Qwen3.5/Qwen3-Next/DeepSeek-V3) reuse the one head autoregressively at depths > 1;
     expect acceptance to decay with depth (the head is trained at depth 1)."""
-    loss_type: str = "soft_ce"
-    """``"soft_ce"`` (distill against the policy's own next-token distribution) or ``"hard_ce"``."""
     loss_weight: float = 0.1
     """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``."""
 

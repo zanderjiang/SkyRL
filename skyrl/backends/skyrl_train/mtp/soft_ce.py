@@ -2,8 +2,7 @@
 #
 # The default soft cross-entropy gives the forward-KL student gradient
 # (``softmax(student) - softmax(teacher)``); the teacher is the policy's own detached next-token
-# distribution, so training the draft head never pulls on the policy trunk. The draft-loss design
-# is inspired by NeMo-RL (https://github.com/NVIDIA-NeMo/RL), heavily adapted for large-vocab memory.
+# distribution, so training the draft head never pulls on the policy trunk.
 
 from typing import Optional
 
@@ -36,19 +35,18 @@ def shift_mask_for_mtp(
     """Roll a ``[batch, seq]`` loss mask to align with an MTP teacher/label at depth ``k``.
 
     Supervision at position ``t`` is valid only if both the source ``t`` and the target ``t+shift``
-    are real tokens, so we AND ``mask[t]`` with ``roll(mask, -shift)`` (tail zeroed). Re-ANDing the
-    source mask is what keeps left padding correct: rolling a left-padded mask left would otherwise
-    unmask a pad slot whose de-padded zero-logit (uniform) inflates the loss by up to ``log(V)``.
+    are real tokens. Re-ANDing the source mask is what keeps left padding correct: rolling a 
+    left-padded mask left would otherwise unmask a pad slot whose de-padded zero-logit (uniform) 
+    inflates the loss by up to ``log(V)``.
 
     With THD sample packing (``trainer.remove_microbatch_padding=true``) the whole micro-batch is one
     packed row ``[1, T]`` holding many concatenated sub-sequences, so a single ``torch.roll`` would
-    leak each sub-sequence's target across its boundary into the next one (slime calls the fix the
-    "roll tensor update for MTP"). Pass ``cu_seqlens`` (the packed *padded* segment boundaries,
-    ``packed_seq_params.cu_seqlens_q_padded``) to roll *within* each segment and zero the trailing
-    ``shift`` positions of every segment instead of only the global tail. This masks exactly the
-    positions whose teacher/label roll crosses a boundary, so those rolls can stay plain global
-    ``torch.roll`` (their wrong values land only on now-zeroed positions). Mirrors the CP=1 branch of
-    megatron-core's ``_roll_tensor_packed_seq``; CP>1 is rejected upstream for MTP.
+    leak each sub-sequence's target across its boundary into the next one. Pass ``cu_seqlens`` 
+    (the packed *padded* segment boundaries, ``packed_seq_params.cu_seqlens_q_padded``) to roll 
+    *within* each segment and zero the trailing ``shift`` positions of every segment instead of only 
+    the global tail. This masks exactly the positions whose teacher/label roll crosses a boundary,
+    so those rolls can stay plain global ``torch.roll`` (their wrong values land only on now-zeroed positions). 
+    Mirrors the CP=1 branch of megatron-core's ``_roll_tensor_packed_seq``; CP>1 is rejected upstream for MTP.
     """
     shift = mtp_layer_number + 1
     if cu_seqlens is None:
@@ -337,68 +335,3 @@ def draft_soft_ce_topk(
         student_logits, teacher_logits.detach(), k, vocab_parallel_group, roll_shift
     )
     return _masked_mean_or_global(per_token_loss, mask, global_normalization_factor)
-
-
-def _onehot_vp_logits(
-    labels: torch.Tensor,
-    like: torch.Tensor,
-    vocab_start_index: int,
-) -> torch.Tensor:
-    """Build vocab-parallel logits whose global softmax is a one-hot over ``labels``.
-
-    Each rank holds ``vocab_size`` columns starting at ``vocab_start_index``. The
-    column matching the label (on whichever rank owns it) is set high and all
-    others low, so a *global* softmax across the TP group recovers the one-hot
-    distribution. Reused to express hard cross-entropy as soft cross-entropy with
-    a one-hot teacher.
-    """
-    vocab_size = like.shape[-1]
-    local_idx = labels.long() - vocab_start_index  # [batch, seq]
-    holds = (local_idx >= 0) & (local_idx < vocab_size)
-    onehot = torch.full_like(like, -30.0)
-    safe_idx = local_idx.clamp(0, vocab_size - 1).unsqueeze(-1)
-    hot = torch.where(holds.unsqueeze(-1), 30.0, -30.0).to(like.dtype)
-    onehot.scatter_(-1, safe_idx, hot)
-    return onehot
-
-
-def draft_hard_ce(
-    student_logits: torch.Tensor,
-    labels: torch.Tensor,
-    mask: torch.Tensor,
-    global_normalization_factor: Optional[torch.Tensor] = None,
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    vocab_start_index: Optional[int] = None,
-    chunk_size: Optional[int] = None,
-) -> torch.Tensor:
-    """Masked-mean hard cross-entropy of the draft head against next-token labels.
-
-    This is the standard MTP-pretraining objective (supervise against the actual
-    future token rather than the policy distribution). Use when
-    ``mtp_loss_type="hard_ce"``.
-
-    Args:
-        student_logits: ``[batch, seq, vocab(/tp)]`` draft-head logits.
-        labels: ``[batch, seq]`` target token ids (already rolled for this MTP depth).
-        mask: ``[batch, seq]`` token mask.
-        global_normalization_factor: see :func:`draft_soft_ce`.
-        vocab_parallel_group: TP group when logits are vocab-sharded.
-        vocab_start_index: This rank's vocab offset (required when TP-sharded).
-        chunk_size: see :func:`draft_soft_ce`. Sequence-chunked + checkpointed when set.
-    """
-    use_vp = vocab_parallel_group is not None and torch.distributed.get_world_size(vocab_parallel_group) > 1
-    if use_vp:
-        assert vocab_start_index is not None, "vocab_start_index is required for vocab-parallel hard CE"
-
-    def per_token(student, lbl):
-        if use_vp:
-            # Hard CE == soft CE with a one-hot teacher; reuse the distributed soft-CE path so the
-            # global (TP) softmax / gradient logic lives in one place.
-            teacher_onehot = _onehot_vp_logits(lbl, student, vocab_start_index)
-            return _VocabParallelSoftCrossEntropy.apply(student, teacher_onehot, vocab_parallel_group)
-        log_probs = F.log_softmax(student.float(), dim=-1)
-        return -log_probs.gather(dim=-1, index=lbl.unsqueeze(-1).long()).squeeze(-1)
-
-    if chunk_size is not None and student_logits.shape[1] > chunk_size:
-        return _chunked_masked_loss(per_token, (student_logits, labels), mask, chunk_size, global_normalization_factor)
-    return _masked_mean_or_global(per_token(student_logits, labels), mask, global_normalization_factor)

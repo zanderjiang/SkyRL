@@ -21,7 +21,7 @@ def test_megatron_config_mtp_defaults():
     assert cfg.mtp_num_layers is None
     # Decoupled draft-training defaults.
     assert cfg.mtp_loss_weight == 0.1
-    assert cfg.mtp_loss_type == "soft_ce"
+    assert cfg.mtp_loss_topk is None
     assert cfg.mtp_detach_trunk is True
     # Fully decoupled by default: the draft loss trains only the MTP-head parameters; the shared
     # embedding/output weight (== the lm_head on tied-embedding models like Qwen3.5) is detached
@@ -30,12 +30,10 @@ def test_megatron_config_mtp_defaults():
 
 
 def test_megatron_config_mtp_overrides_parse():
-    cfg = build_nested_dataclass(
-        MegatronConfig, {"mtp_num_layers": 2, "mtp_loss_weight": 0.3, "mtp_loss_type": "hard_ce"}
-    )
+    cfg = build_nested_dataclass(MegatronConfig, {"mtp_num_layers": 2, "mtp_loss_weight": 0.3, "mtp_loss_topk": 64})
     assert cfg.mtp_num_layers == 2
     assert cfg.mtp_loss_weight == 0.3
-    assert cfg.mtp_loss_type == "hard_ce"
+    assert cfg.mtp_loss_topk == 64
 
 
 def test_megatron_config_mtp_force_disable():
@@ -59,7 +57,6 @@ def test_mtp_config_defaults():
     cfg = MTPConfig()
     assert cfg.enabled is False
     assert cfg.num_speculative_tokens == 1
-    assert cfg.loss_type == "soft_ce"
     assert cfg.loss_weight == 0.1
 
 

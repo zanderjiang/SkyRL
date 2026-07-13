@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from skyrl.backends.skyrl_train.mtp.soft_ce import (
     build_teacher_logits,
-    draft_hard_ce,
     draft_soft_ce,
     shift_mask_for_mtp,
 )
@@ -70,25 +69,6 @@ def test_draft_soft_ce_chunked_matches_unchunked():
 
     s2 = student.clone().requires_grad_(True)
     loss_chunked = draft_soft_ce(s2, teacher, mask, chunk_size=4)  # 9 -> chunks of 4,4,1
-    loss_chunked.backward()
-
-    assert torch.allclose(loss_full, loss_chunked, atol=1e-6)
-    assert torch.allclose(s1.grad, s2.grad, atol=1e-6)
-
-
-def test_draft_hard_ce_chunked_matches_unchunked():
-    torch.manual_seed(1)
-    student = torch.randn(2, 9, 7)
-    labels = torch.randint(0, 7, (2, 9))
-    mask = torch.ones(2, 9)
-    mask[1, 6:] = 0
-
-    s1 = student.clone().requires_grad_(True)
-    loss_full = draft_hard_ce(s1, labels, mask)
-    loss_full.backward()
-
-    s2 = student.clone().requires_grad_(True)
-    loss_chunked = draft_hard_ce(s2, labels, mask, chunk_size=4)
     loss_chunked.backward()
 
     assert torch.allclose(loss_full, loss_chunked, atol=1e-6)
@@ -210,17 +190,6 @@ def test_soft_ce_respects_mask():
     a = draft_soft_ce(student, teacher, mask)
     b = draft_soft_ce(student, teacher_alt, mask)
     assert torch.allclose(a, b, atol=1e-6)
-
-
-def test_hard_ce_matches_reference():
-    torch.manual_seed(2)
-    student = torch.randn(2, 5, 7, requires_grad=True)
-    labels = torch.randint(0, 7, (2, 5))
-    mask = torch.ones(2, 5)
-
-    got = draft_hard_ce(student, labels, mask)
-    ref = (-F.log_softmax(student, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1) * mask).sum() / mask.sum()
-    assert torch.allclose(got, ref, atol=1e-6)
 
 
 def test_build_teacher_logits_rolls_and_detaches():

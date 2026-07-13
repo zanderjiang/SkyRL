@@ -38,9 +38,7 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
     def probe_packed_vs_unpacked(self, token_ids_list) -> dict:
-        import torch
         import megatron.core.parallel_state as mpu
-        from megatron.core.utils import unwrap_model
 
         from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
             recover_left_padding,
@@ -89,7 +87,9 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 lm = mask_fn(mask, k)
                 out.append(
                     draft_soft_ce(
-                        st, teacher, lm,
+                        st,
+                        teacher,
+                        lm,
                         vocab_parallel_group=tp_grp if vp else None,
                     ).item()
                 )
@@ -169,9 +169,7 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
 
         # replay-vs-native divergence at REAL positions only (pad positions are zero-filled).
         m3 = am_bool.unsqueeze(-1)
-        max_abs = max(
-            ((r - n).abs() * m3).max().item() for r, n in zip(replay_students, native_students)
-        )
+        max_abs = max(((r - n).abs() * m3).max().item() for r, n in zip(replay_students, native_students))
         pad_frac = 1.0 - (attention_mask.sum().item() / (B * L))
 
         return {
@@ -207,7 +205,6 @@ def _cfg():
     cfg.trainer.policy.megatron_config.context_parallel_size = 1
     cfg.trainer.mtp.enabled = True
     cfg.trainer.mtp.num_speculative_tokens = 1
-    cfg.trainer.mtp.loss_type = "soft_ce"
     validate_cfg(cfg)
     return cfg
 
@@ -238,12 +235,8 @@ def test_mtp_packed_vs_unpacked(ray_init_fixture):
     _orig = _megatron_worker_mod.PolicyWorker
     _megatron_worker_mod.PolicyWorker = _ProbePolicyWorker
     try:
-        policy = init_worker_with_type(
-            "policy", shared_pg=None, colocate_all=False, num_gpus_per_node=tp, cfg=cfg
-        )
-        res = ray.get(
-            policy.async_run_ray_method("pass_through", "probe_packed_vs_unpacked", token_ids_list)
-        )[0]
+        policy = init_worker_with_type("policy", shared_pg=None, colocate_all=False, num_gpus_per_node=tp, cfg=cfg)
+        res = ray.get(policy.async_run_ray_method("pass_through", "probe_packed_vs_unpacked", token_ids_list))[0]
     finally:
         _megatron_worker_mod.PolicyWorker = _orig
 
