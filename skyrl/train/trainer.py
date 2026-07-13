@@ -945,6 +945,7 @@ class RayPPOTrainer:
 
         return training_input
 
+    @torch.no_grad()
     async def generate(
         self,
         input_batch: GeneratorInput,
