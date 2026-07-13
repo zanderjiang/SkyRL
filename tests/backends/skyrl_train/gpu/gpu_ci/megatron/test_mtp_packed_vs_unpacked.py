@@ -33,7 +33,11 @@ from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.utils.utils import validate_cfg
 from tests.backends.skyrl_train.gpu.utils import init_worker_with_type
 
-MODEL_NAME = "Qwen/Qwen3.5-2B"
+# MiMo-7B-RL, not Qwen3.5: Qwen3.5's GDN layers cannot sample-pack at all (megatron-LM PR #2644),
+# so its recipes run remove_microbatch_padding=false and the wrapper rejects packing outright --
+# there is no packed path to probe. MiMo is dense (Qwen2-style attention) and ships a native MTP
+# head, and its spec-decode recipe packs for real, so this exercises the path production uses.
+MODEL_NAME = "XiaomiMiMo/MiMo-7B-RL"
 
 
 class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
@@ -200,13 +204,6 @@ def _cfg():
     cfg.trainer.placement.colocate_all = False
     cfg.trainer.placement.policy_num_gpus_per_node = tp
     cfg.trainer.placement.ref_num_gpus_per_node = tp
-    # Qwen3.5 dispatches to the VL bridge (Qwen3VLModel), which packs sequences inside its own
-    # forward -- SkyRL packing on top of that double-packs and corrupts the GDN cu_seqlens, so the
-    # wrapper rejects it. language_model_only routes to the native GPTModel GDN packing path, which
-    # is what the real recipes use and what this test needs (it exercises the packed path).
-    cfg.trainer.policy.language_model_only = True
-    cfg.trainer.ref.language_model_only = True
-    cfg.generator.inference_engine.language_model_only = True
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.context_parallel_size = 1

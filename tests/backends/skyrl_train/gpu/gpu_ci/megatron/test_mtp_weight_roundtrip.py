@@ -109,15 +109,20 @@ def _make_policy_cfg(model_name: str) -> SkyRLTrainConfig:
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.context_parallel_size = 1
-    # Enable MTP via the high-level knob, exactly as the training run does. validate_cfg ->
-    # _apply_mtp_config propagates this to policy.megatron_config.mtp_num_layers (setting it
-    # directly is clobbered back to 0/None by _apply_mtp_config when trainer.mtp.enabled is False).
+    # This test only round-trips MTP head weights; packing is irrelevant and Qwen3.5's GDN layers
+    # cannot sample-pack anyway (the wrapper rejects it -- see the 9B recipe's remove_microbatch_padding=false).
+    cfg.trainer.remove_microbatch_padding = False
+    # Enable MTP via the high-level knob, exactly as the training run does. The trained head count
+    # stays None on purpose: the draft DEPTH (num_speculative_tokens) is inference-only, and the head
+    # count is inferred from the checkpoint's HF config by the bridge. (_apply_mtp_config only forces
+    # it to 0 when trainer.mtp.enabled is False.)
     cfg.trainer.mtp.enabled = True
     cfg.trainer.mtp.num_speculative_tokens = 1
     cfg.trainer.mtp.loss_weight = 0.1
     validate_cfg(cfg)
-    assert cfg.trainer.policy.megatron_config.mtp_num_layers == 1, (
-        f"expected mtp_num_layers=1 after validate_cfg, got " f"{cfg.trainer.policy.megatron_config.mtp_num_layers}"
+    assert cfg.trainer.policy.megatron_config.mtp_num_layers is None, (
+        "expected mtp_num_layers=None (inferred from the checkpoint) after validate_cfg, got "
+        f"{cfg.trainer.policy.megatron_config.mtp_num_layers}"
     )
     return cfg
 
