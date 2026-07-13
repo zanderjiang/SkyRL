@@ -20,7 +20,7 @@ class _CanonicalGradStrides(torch.autograd.Function):
     At micro-batch 1 the grad is a transpose-backward view whose stale size-1 batch stride fails
     matmul's ``should_fold`` check, so it dispatches a broadcast ``bmm`` ~100x slower than the
     equivalent ``mm`` (measured 1.27s vs 10ms/microbatch on H100). Re-viewing the dense grad restores
-    canonical strides at zero copy. No-op on the non-detached path.
+    canonical strides at zero copy.
     """
 
     @staticmethod
@@ -34,7 +34,7 @@ class _CanonicalGradStrides(torch.autograd.Function):
         return grad.contiguous()
 
 
-def project_mtp_hidden_to_logits(hidden_states_per_layer, model, detach_output_weight: bool = False) -> List:
+def project_mtp_hidden_to_logits(hidden_states_per_layer, model) -> List:
     """Run the model's shared output layer on each captured MTP hidden-state chunk.
 
     Like the model's ``_postprocess``: output-layer logits come out ``[seq, batch, vocab/tp]`` and are
@@ -44,18 +44,16 @@ def project_mtp_hidden_to_logits(hidden_states_per_layer, model, detach_output_w
     Takes one ``[seq, batch, hidden]`` tensor per MTP depth (from
     ``MTPHiddenCapture.compute_student_hidden_states``) and returns one ``[batch, seq, vocab/tp]``
     student-logits tensor each.
+
+    The output weight is detached (tied weight, or the output layer's own on untied models -- either
+    way a policy param), so the draft loss trains only the MTP-head params.
     """
-    output_weight = None
     if getattr(model, "share_embeddings_and_output_weights", False):
         output_weight = model.shared_embedding_or_output_weight()
-    if detach_output_weight:
-        # Isolate the output projection from the draft gradient: detach the shared/tied weight, or for
-        # untied models pass the output layer's own weight as a detached tensor. With the capture's
-        # detached re-embedding, the draft loss then trains only the MTP-head parameters.
-        if output_weight is None:
-            output_weight = getattr(model.output_layer, "weight", None)
-        if output_weight is not None:
-            output_weight = output_weight.detach()
+    else:
+        output_weight = getattr(model.output_layer, "weight", None)
+    if output_weight is not None:
+        output_weight = output_weight.detach()
 
     logits_per_layer = []
     for hidden in hidden_states_per_layer:

@@ -350,15 +350,13 @@ class MegatronModelWrapper:
         # still run inside the forward (so we reuse their rotary embeddings); the native process_mtp_loss
         # is disabled at its call sites (see mtp/native_loss_patch.py, applied at config time) so no
         # native MTP gradient couples onto the trunk. A forward hook captures the heads' hidden states
-        # (trunk input optionally detached) for us to score. Training only.
+        # (with the trunk input detached) for us to score. Training only.
         model_config = get_model_config(self.actor_module[0])
         mtp_enabled = (not forward_only) and bool(getattr(model_config, "mtp_num_layers", None))
         # Defaults live on the MegatronConfig dataclass (config.py) -- read the fields directly
         # rather than restating them in getattr fallbacks that could drift.
         mcfg = self.cfg.policy.megatron_config
         mtp_loss_weight = float(mcfg.mtp_loss_weight)
-        mtp_detach_trunk = bool(mcfg.mtp_detach_trunk)
-        mtp_detach_shared_output = bool(mcfg.mtp_detach_shared_output)
         mtp_loss_chunk_size = mcfg.mtp_loss_chunk_size
         mtp_loss_topk = mcfg.mtp_loss_topk
 
@@ -487,7 +485,8 @@ class MegatronModelWrapper:
                 mtp_cu_seqlens = packed_seq_params.cu_seqlens_q_padded if packed else None
                 vocab_size_tp = logits.shape[-1]
                 # Undo the in-place temperature scaling so the teacher is the true policy distribution.
-                teacher_src = logits if temperature == 1.0 else logits * temperature
+                # Detached: both draft-loss paths below require a detached teacher.
+                teacher_src = (logits if temperature == 1.0 else logits * temperature).detach()
                 # Megatron may pad the vocab to divide across TP; padded rows are never trained, so slice
                 # this rank's shard to its true width to keep them out of the teacher (a view; autograd
                 # zero-fills the tail).
@@ -517,7 +516,7 @@ class MegatronModelWrapper:
                             )
                         )
                     else:
-                        teacher_logits = build_teacher_logits(teacher_src, layer_idx, detach=True)
+                        teacher_logits = build_teacher_logits(teacher_src, layer_idx)
                         per_layer_losses.append(
                             draft_soft_ce(
                                 student_logits,
@@ -647,9 +646,9 @@ class MegatronModelWrapper:
                 + (kl_loss_term - entropy_loss_term) * kl_entropy_microbatch_scale
             )
             # The decoupled MTP/draft loss is a per-token mean (like KL/entropy), so fold it in with
-            # the same micro-batch correction. Its gradient only reaches the MTP-head parameters (and
-            # the shared output/embedding unless mtp_detach_shared_output) because both the trunk
-            # hidden states and the teacher distribution are detached.
+            # the same micro-batch correction. Its gradient only reaches the MTP-head parameters: the
+            # trunk hidden states, the re-embedding, the output weight and the teacher distribution
+            # are all detached.
             if draft_loss is not None:
                 loss = loss + mtp_loss_weight * draft_loss * kl_entropy_microbatch_scale
             unscaled_loss = loss / grad_sum_correction_factor
@@ -785,14 +784,7 @@ class MegatronModelWrapper:
             # Run the policy forward; when MTP is active a pre-hook records the MTP block's arguments.
             student_hidden = None
             student_model = None
-            with maybe_capture_mtp_hidden(
-                model,
-                mtp_enabled,
-                detach_trunk=mtp_detach_trunk,
-                # Full shared-weight isolation also detaches the MTP block's re-embedding of the rolled
-                # input ids (the second gradient path into the tied embedding/lm_head).
-                detach_shared_embedding=mtp_detach_shared_output,
-            ) as capture:
+            with maybe_capture_mtp_hidden(model, mtp_enabled) as capture:
                 outputs = model(
                     new_sequences,
                     new_position_ids,
@@ -813,9 +805,7 @@ class MegatronModelWrapper:
             # packing, or de-pad to [batch, seq_len, vocab/tp] otherwise. When packed, also hand
             # loss_func the packed real-token mask so it can mask cross-segment MTP targets.
             if student_hidden is not None:
-                student_logits = project_mtp_hidden_to_logits(
-                    student_hidden, student_model, detach_output_weight=mtp_detach_shared_output
-                )
+                student_logits = project_mtp_hidden_to_logits(student_hidden, student_model)
                 if self.remove_microbatch_padding:
                     batch["mtp_student_logits"] = student_logits
                     batch["mtp_packed_mask"] = _build_packed_valid_mask(

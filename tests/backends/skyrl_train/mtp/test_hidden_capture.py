@@ -80,9 +80,9 @@ class _FakeMamba(_FakeGPT):
         return hidden @ w.t(), None
 
 
-def _run(detach_trunk, model_cls=_FakeGPT, mtp_num_layers=1):
+def _run(model_cls=_FakeGPT, mtp_num_layers=1):
     model = model_cls(mtp_num_layers=mtp_num_layers)
-    capture = MTPHiddenCapture(model, detach_trunk=detach_trunk)
+    capture = MTPHiddenCapture(model)
     s, b, h = 3, 2, 4
     trunk = torch.randn(s, b, h, requires_grad=True)
     with capture.capture():
@@ -104,20 +104,20 @@ def test_capture_rejects_dropout_on_mtp_block():
 
 
 def test_capture_returns_one_chunk_per_mtp_depth():
-    _, _, student = _run(detach_trunk=True)
+    _, _, student = _run()
     assert student is not None and len(student) == 1
     assert student[0].shape == (3, 2, 4)
 
 
 def test_capture_returns_one_chunk_per_depth_multilayer():
     # chunk[-num_layers:] must return exactly this stage's MTP-depth outputs.
-    _, _, student = _run(detach_trunk=True, mtp_num_layers=2)
+    _, _, student = _run(mtp_num_layers=2)
     assert student is not None and len(student) == 2
     assert all(chunk.shape == (3, 2, 4) for chunk in student)
 
 
-def test_replay_detaches_trunk_when_detach_trunk_true():
-    model, trunk, student = _run(detach_trunk=True)
+def test_replay_detaches_trunk():
+    model, trunk, student = _run()
     student[0].sum().backward()
     # The MTP-head parameter receives gradient...
     assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
@@ -125,18 +125,10 @@ def test_replay_detaches_trunk_when_detach_trunk_true():
     assert trunk.grad is None
 
 
-def test_replay_couples_trunk_when_detach_trunk_false():
-    model, trunk, student = _run(detach_trunk=False)
-    student[0].sum().backward()
-    assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
-    # With detach disabled, the gradient flows back into the trunk hidden states.
-    assert trunk.grad is not None and trunk.grad.abs().sum() > 0
-
-
 def test_capture_is_model_agnostic_mambamodel():
     # The capture must work identically for a MambaModel-like base (Qwen3.5), exposing the same
     # .mtp surface. capture.model is the unwrapped model (renamed from the old GPTModel-specific attr).
-    model, trunk, student = _run(detach_trunk=True, model_cls=_FakeMamba)
+    model, trunk, student = _run(model_cls=_FakeMamba)
     assert isinstance(MTPHiddenCapture(model).model, _FakeMamba)
     assert student is not None and len(student) == 1
     assert student[0].shape == (3, 2, 4)
@@ -144,25 +136,17 @@ def test_capture_is_model_agnostic_mambamodel():
 
 def test_project_to_logits_decoupled_end_to_end():
     # End-to-end through the adapter: capture (detached) -> shared output layer -> student logits.
-    # The draft gradient reaches the MTP head + shared output weight, never the trunk.
-    model, trunk, student = _run(detach_trunk=True, model_cls=_FakeMamba)
+    # The draft gradient reaches ONLY the MTP head: not the trunk, and not the tied embedding/lm_head
+    # (which the output projection would otherwise train, nudging the policy's own logits).
+    model, trunk, student = _run(model_cls=_FakeMamba)
     logits = project_mtp_hidden_to_logits(student, model)
     assert len(logits) == 1
     # [seq, batch, vocab] -> transposed to [batch, seq, vocab].
     assert logits[0].shape == (2, 3, 5)
     logits[0].sum().backward()
     assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
-    assert model._out_weight.grad is not None and model._out_weight.grad.abs().sum() > 0
-    assert trunk.grad is None
-
-
-def test_project_to_logits_detach_shared_output():
-    # detach_output_weight=True isolates the shared embedding/output weight from the draft gradient.
-    model, trunk, student = _run(detach_trunk=True, model_cls=_FakeMamba)
-    logits = project_mtp_hidden_to_logits(student, model, detach_output_weight=True)
-    logits[0].sum().backward()
-    assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
     assert model._out_weight.grad is None
+    assert trunk.grad is None
 
 
 class _FakeEmbedding(nn.Module):
@@ -186,11 +170,13 @@ class _FakeMTPBlockWithEmbedding(_FakeMTPBlock):
         return torch.cat(chunks, dim=0)
 
 
-def _run_with_embedding(detach_shared_embedding):
+def test_replay_detaches_shared_embedding():
+    # The replay must also sever the re-embedding path (the second route into the tied
+    # embedding/lm_head, next to the output projection) so only MTP-head params train.
     model = _FakeGPT()
     model.mtp = _FakeMTPBlockWithEmbedding(hidden=4, num_layers=1)
     embedding = _FakeEmbedding(vocab=5, hidden=4)
-    capture = MTPHiddenCapture(model, detach_trunk=True, detach_shared_embedding=detach_shared_embedding)
+    capture = MTPHiddenCapture(model)
     s, b = 3, 2
     trunk = torch.randn(s, b, 4, requires_grad=True)
     ids = torch.randint(0, 5, (b, s))
@@ -198,21 +184,10 @@ def _run_with_embedding(detach_shared_embedding):
         _ = model.mtp(hidden_states=trunk, input_ids=ids, embedding=embedding)
     student = capture.compute_student_hidden_states()
     student[0].sum().backward()
-    return model, embedding
 
-
-def test_replay_detaches_shared_embedding_when_requested():
-    # mtp_detach_shared_output must also sever the re-embedding path (the second route into the
-    # tied embedding/lm_head, next to the output projection) so only MTP-head params train.
-    model, embedding = _run_with_embedding(detach_shared_embedding=True)
     assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
     assert embedding.weight.grad is None
-
-
-def test_replay_trains_shared_embedding_by_default():
-    model, embedding = _run_with_embedding(detach_shared_embedding=False)
-    assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
-    assert embedding.weight.grad is not None and embedding.weight.grad.abs().sum() > 0
+    assert trunk.grad is None
 
 
 def test_replay_asserts_on_positional_hidden_states():
@@ -222,7 +197,7 @@ def test_replay_asserts_on_positional_hidden_states():
 
     model = _FakeGPT()
     trunk = torch.randn(3, 2, 4, requires_grad=True)
-    capture = MTPHiddenCapture(model, detach_trunk=True)
+    capture = MTPHiddenCapture(model)
     with capture.capture():
         _ = model.mtp(trunk, position_ids=torch.zeros(2, 3))  # positional hidden_states
     with pytest.raises(AssertionError, match="keyword argument"):
@@ -249,10 +224,11 @@ class _FakeUntied(_FakeGPT):
 
 
 def test_project_to_logits_detach_output_weight_untied_model():
-    # detach_output_weight must also isolate an UNTIED model's own output-layer weight (passed
-    # explicitly as a detached tensor), not just the tied/shared weight.
-    model, trunk, student = _run(detach_trunk=True, model_cls=_FakeUntied)
-    logits = project_mtp_hidden_to_logits(student, model, detach_output_weight=True)
+    # The projection must also isolate an UNTIED model's own output-layer weight (passed explicitly
+    # as a detached tensor), not just the tied/shared weight -- it is still the weight that produces
+    # the policy's own logits.
+    model, trunk, student = _run(model_cls=_FakeUntied)
+    logits = project_mtp_hidden_to_logits(student, model)
     logits[0].sum().backward()
     assert model.mtp.w[0].grad is not None and model.mtp.w[0].grad.abs().sum() > 0
     assert model.output_layer.weight.grad is None
@@ -280,7 +256,7 @@ def test_capture_descends_into_language_model_for_vl_wrapper():
     host = _resolve_mtp_host(model)
     assert host is model.language_model  # ...capture resolves the nested language model.
 
-    capture = MTPHiddenCapture(model, detach_trunk=True)
+    capture = MTPHiddenCapture(model)
     assert capture.model is model.language_model
     assert capture.mtp_num_layers == 1
 
@@ -308,7 +284,7 @@ def test_resolve_mtp_host_returns_model_when_no_mtp_anywhere():
 def test_no_capture_when_block_absent():
     model = _FakeGPT()
     model.mtp = None
-    capture = MTPHiddenCapture(model, detach_trunk=True)
+    capture = MTPHiddenCapture(model)
     with capture.capture():
         pass
     assert capture.compute_student_hidden_states() is None

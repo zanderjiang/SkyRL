@@ -75,14 +75,11 @@ TIS_TYPE=token
 # depth since the head never trains on its own outputs). Here k=3.
 MTP_ENABLED=true
 MTP_NUM_SPECULATIVE_TOKENS=3
-MTP_LOSS_TYPE="soft_ce" # "soft_ce" (distill against policy) | "hard_ce" (ground-truth next tokens)
 MTP_LOSS_WEIGHT=1.0
-# NOTE: trainer.policy.megatron_config.mtp_detach_shared_output now defaults to true: the draft loss
-# trains ONLY the MTP-head params; the tied embedding/lm_head is detached (output projection AND the
-# MTP block's re-embedding), so the draft gradient no longer nudges the policy's own logits. Set it
-# to false for the old NeMo-RL behaviour (shared head also trained by the draft loss).
+# NOTE: the draft loss trains ONLY the MTP-head params -- trunk, re-embedding, output weight and
+# teacher are all detached, so it never nudges the backbone or the tied lm_head.
 # Top-k draft loss: distill only the teacher's top-k tokens instead of the full 248K vocab, keeping
-# draft-loss memory at O(seq*k) vs O(seq*vocab). Only applies to mtp_loss_type="soft_ce". Here k=256.
+# draft-loss memory at O(seq*k) vs O(seq*vocab). Here k=256.
 MTP_LOSS_TOPK=256
 
 
@@ -162,7 +159,6 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.mtp.enabled=$MTP_ENABLED \
   trainer.mtp.num_speculative_tokens=$MTP_NUM_SPECULATIVE_TOKENS \
-  trainer.mtp.loss_type=$MTP_LOSS_TYPE \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \
   trainer.policy.megatron_config.mtp_loss_topk=$MTP_LOSS_TOPK \
   trainer.logger="$LOGGER" \

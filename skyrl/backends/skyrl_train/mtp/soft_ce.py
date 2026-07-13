@@ -13,20 +13,24 @@ import torch.nn.functional as F
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 
 
+def _assert_teacher_detached(teacher_logits: torch.Tensor) -> None:
+    """The teacher is the policy's own distribution: attached, the draft loss would train the policy
+    to be easier to draft. Callers detach it; not every loss path would refuse the gradient."""
+    assert not teacher_logits.requires_grad, "MTP draft loss: teacher_logits must be detached"
+
+
 def build_teacher_logits(
     main_logits: torch.Tensor,
     mtp_layer_number: int = 0,
-    detach: bool = True,
 ) -> torch.Tensor:
     """Build the soft-distillation teacher for MTP depth ``k`` (0-indexed).
 
     Depth ``k`` predicts ``seq[t+k+2]`` at position ``t``, whose teacher distribution is the policy's
-    own distribution at ``t+k+1`` — i.e. ``main_logits`` rolled left by ``k+1`` (and detached, so no
-    gradient reaches the trunk). The wrapped tail positions are invalid; the caller's loss mask zeros
+    own distribution at ``t+k+1`` — i.e. ``main_logits`` rolled left by ``k+1`` (detached, so no
+    gradient reaches the policy). The wrapped tail positions are invalid; the caller's loss mask zeros
     them (see ``shift_mask_for_mtp``).
     """
-    teacher = main_logits.detach() if detach else main_logits
-    return torch.roll(teacher, shifts=-(mtp_layer_number + 1), dims=1)
+    return torch.roll(main_logits.detach(), shifts=-(mtp_layer_number + 1), dims=1)
 
 
 def shift_mask_for_mtp(
@@ -35,17 +39,17 @@ def shift_mask_for_mtp(
     """Roll a ``[batch, seq]`` loss mask to align with an MTP teacher/label at depth ``k``.
 
     Supervision at position ``t`` is valid only if both the source ``t`` and the target ``t+shift``
-    are real tokens. Re-ANDing the source mask is what keeps left padding correct: rolling a 
-    left-padded mask left would otherwise unmask a pad slot whose de-padded zero-logit (uniform) 
+    are real tokens. Re-ANDing the source mask is what keeps left padding correct: rolling a
+    left-padded mask left would otherwise unmask a pad slot whose de-padded zero-logit (uniform)
     inflates the loss by up to ``log(V)``.
 
     With THD sample packing (``trainer.remove_microbatch_padding=true``) the whole micro-batch is one
     packed row ``[1, T]`` holding many concatenated sub-sequences, so a single ``torch.roll`` would
-    leak each sub-sequence's target across its boundary into the next one. Pass ``cu_seqlens`` 
-    (the packed *padded* segment boundaries, ``packed_seq_params.cu_seqlens_q_padded``) to roll 
-    *within* each segment and zero the trailing ``shift`` positions of every segment instead of only 
+    leak each sub-sequence's target across its boundary into the next one. Pass ``cu_seqlens``
+    (the packed *padded* segment boundaries, ``packed_seq_params.cu_seqlens_q_padded``) to roll
+    *within* each segment and zero the trailing ``shift`` positions of every segment instead of only
     the global tail. This masks exactly the positions whose teacher/label roll crosses a boundary,
-    so those rolls can stay plain global ``torch.roll`` (their wrong values land only on now-zeroed positions). 
+    so those rolls can stay plain global ``torch.roll`` (their wrong values land only on now-zeroed positions).
     Mirrors the CP=1 branch of megatron-core's ``_roll_tensor_packed_seq``; CP>1 is rejected upstream for MTP.
     """
     shift = mtp_layer_number + 1
@@ -220,6 +224,7 @@ def draft_soft_ce(
     Returns:
         Scalar loss.
     """
+    _assert_teacher_detached(teacher_logits)
     use_vp = vocab_parallel_group is not None and torch.distributed.get_world_size(vocab_parallel_group) > 1
 
     def per_token(student, teacher):
@@ -323,7 +328,7 @@ def draft_soft_ce_topk(
     :class:`_VocabParallelTopkSoftCE` for the (parallelism-scalable) implementation. Approximate: drops
     the teacher tail, which is benign for a draft head (acceptance is governed by the top tokens).
 
-    Args mirror :func:`draft_soft_ce`, plus:
+    Args mirror :func:`draft_soft_ce` (``teacher_logits`` must already be detached), plus:
         k: number of top teacher tokens to distill.
         roll_shift: if non-zero, ``teacher_logits`` is the *un-rolled* policy logits and the draft
             target for position ``t`` is the policy distribution at ``t + roll_shift`` (= the MTP-depth
@@ -331,7 +336,6 @@ def draft_soft_ce_topk(
             rolled, avoiding a full ``[S, vocab]`` rolled-teacher copy. ``0`` means ``teacher_logits``
             is already aligned/rolled (the caller's ``build_teacher_logits`` path).
     """
-    per_token_loss = _VocabParallelTopkSoftCE.apply(
-        student_logits, teacher_logits.detach(), k, vocab_parallel_group, roll_shift
-    )
+    _assert_teacher_detached(teacher_logits)
+    per_token_loss = _VocabParallelTopkSoftCE.apply(student_logits, teacher_logits, k, vocab_parallel_group, roll_shift)
     return _masked_mean_or_global(per_token_loss, mask, global_normalization_factor)

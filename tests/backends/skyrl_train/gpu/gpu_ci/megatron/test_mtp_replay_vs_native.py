@@ -44,8 +44,6 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
     def probe_replay_vs_native(self, token_ids=None, seq_len: int = 96) -> dict:
-        from megatron.core.utils import unwrap_model
-
         from skyrl.backends.skyrl_train.mtp.adapter import project_mtp_hidden_to_logits
         from skyrl.backends.skyrl_train.mtp.hidden_capture import (
             MTPHiddenCapture,
@@ -53,7 +51,6 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
             _unwrap_model,
         )
 
-        gm = unwrap_model(self.actor_module[0])
         host = _resolve_mtp_host(_unwrap_model(self.actor_module[0]))
         if getattr(host, "mtp", None) is None:
             return {"error": "no mtp head built", "host": type(host).__name__}
@@ -79,7 +76,7 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
 
         mtp = host.mtp
         h = mtp.register_forward_hook(_out_hook)
-        capture = MTPHiddenCapture(self.actor_module[0], detach_trunk=True)
+        capture = MTPHiddenCapture(self.actor_module[0])
         try:
             with torch.no_grad(), capture.capture():
                 outputs = self.actor_module[0](sequences, position_ids, attention_mask)

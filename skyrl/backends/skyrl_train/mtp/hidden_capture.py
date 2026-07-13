@@ -1,8 +1,9 @@
 # Decoupled capture of the trunk hidden states feeding the MTP/draft head (inspired by NeMo-RL,
 # adapted for SkyRL's Megatron backend). Works for any Megatron model exposing ``self.mtp``.
 # A forward pre-hook records the kwargs Megatron builds for ``self.mtp``; after the forward we
-# re-invoke it with the trunk hidden states detached, so the draft gradient reaches the head but not
-# the policy backbone. Reusing the captured kwargs avoids rebuilding rotary embeddings / masks.
+# re-invoke it with the trunk hidden states (and the shared re-embedding) detached, so the draft
+# gradient reaches the head but no policy parameter. Reusing the captured kwargs avoids rebuilding
+# rotary embeddings / masks.
 
 from __future__ import annotations
 
@@ -58,15 +59,10 @@ class MTPHiddenCapture:
     output layer.
     """
 
-    def __init__(self, model, detach_trunk: bool = True, detach_shared_embedding: bool = False):
+    def __init__(self, model):
         # The module that owns the MTP block is also what the caller projects through (output_layer /
         # shared weight), so they must match.
         self.model = _resolve_mtp_host(_unwrap_model(model))
-        self.detach_trunk = detach_trunk
-        # The MTP block re-embeds the rolled input ids through the shared embedding -- a second
-        # gradient path into the embedding weight besides the output projection. detach_shared_embedding
-        # cuts it too, so tied-embedding models don't keep training the lm_head through the lookup.
-        self.detach_shared_embedding = detach_shared_embedding
         self._args = None
         self._kwargs = None
         self._handles: list = []
@@ -125,18 +121,20 @@ class MTPHiddenCapture:
         import torch
 
         kwargs = dict(self._kwargs)
-        if self.detach_trunk:
-            hidden = kwargs.get("hidden_states")
-            # We only patch the keyword arg. Megatron passes hidden_states as a kwarg today; if a
-            # future version passes it positionally the detach would silently no-op (re-coupling the
-            # trunk), so fail loudly instead.
-            assert hidden is not None, (
-                "MTP capture: 'hidden_states' was not passed to the MTP block as a keyword argument "
-                "(megatron-core call convention changed?); cannot detach the trunk for decoupled "
-                "draft training."
-            )
-            kwargs["hidden_states"] = hidden.detach()
-        if self.detach_shared_embedding and kwargs.get("embedding") is not None:
+        hidden = kwargs.get("hidden_states")
+        # We only patch the keyword arg. Megatron passes hidden_states as a kwarg today; if a
+        # future version passes it positionally the detach would silently no-op (re-coupling the
+        # trunk), so fail loudly instead.
+        assert hidden is not None, (
+            "MTP capture: 'hidden_states' was not passed to the MTP block as a keyword argument "
+            "(megatron-core call convention changed?); cannot detach the trunk for decoupled "
+            "draft training."
+        )
+        kwargs["hidden_states"] = hidden.detach()
+
+        # The block re-embeds the rolled ids: a second gradient path into the embedding weight (== the
+        # lm_head on tied models) besides the output projection. Detach it too.
+        if kwargs.get("embedding") is not None:
             orig_embedding = kwargs["embedding"]
 
             def _detached_embedding(*emb_args, **emb_kwargs):
@@ -157,11 +155,11 @@ class MTPHiddenCapture:
 
 
 @contextmanager
-def maybe_capture_mtp_hidden(model, enabled: bool, detach_trunk: bool = True, detach_shared_embedding: bool = False):
+def maybe_capture_mtp_hidden(model, enabled: bool):
     """Context manager returning an ``MTPHiddenCapture`` when ``enabled``, else ``None``."""
     if not enabled:
         yield None
         return
-    capture = MTPHiddenCapture(model, detach_trunk=detach_trunk, detach_shared_embedding=detach_shared_embedding)
+    capture = MTPHiddenCapture(model)
     with capture.capture():
         yield capture

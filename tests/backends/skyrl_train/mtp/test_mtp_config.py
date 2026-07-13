@@ -19,14 +19,11 @@ def test_megatron_config_mtp_defaults():
     cfg = MegatronConfig()
     # None => honor the model's own num_nextn_predict_layers (no SkyRL override).
     assert cfg.mtp_num_layers is None
-    # Decoupled draft-training defaults.
+    # Decoupled draft-training defaults. The decoupling itself is unconditional (no knob): the draft
+    # loss trains only the MTP-head parameters -- trunk, teacher, output projection and the MTP
+    # block's re-embedding are all detached (see mtp/hidden_capture.py, mtp/adapter.py).
     assert cfg.mtp_loss_weight == 0.1
     assert cfg.mtp_loss_topk is None
-    assert cfg.mtp_detach_trunk is True
-    # Fully decoupled by default: the draft loss trains only the MTP-head parameters; the shared
-    # embedding/output weight (== the lm_head on tied-embedding models like Qwen3.5) is detached
-    # in both the output projection and the MTP block's re-embedding (slime-style).
-    assert cfg.mtp_detach_shared_output is True
 
 
 def test_megatron_config_mtp_overrides_parse():

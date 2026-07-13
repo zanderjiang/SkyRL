@@ -227,26 +227,9 @@ class MegatronConfig(BaseConfig):
     (``num_nextn_predict_layers``); an int overrides it (``0`` force-disables MTP). Active heads are
     trained with the decoupled draft loss and synced to vLLM for speculative decoding."""
     mtp_loss_weight: float = 0.1
-    """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``. The draft loss trains the
-    MTP heads on *detached* trunk hidden states, so it never pulls on the policy backbone. Only used
-    when MTP heads are active."""
-    mtp_detach_trunk: bool = True
-    """Detach the trunk hidden states feeding the MTP head so only the head's parameters get the draft
-    gradient. If False, the gradient flows back into the policy backbone (Megatron's coupled MTP)."""
-    mtp_detach_shared_output: bool = True
-    """Also isolate the shared embedding/output weights from the draft loss (detach both the output
-    projection and the MTP block's re-embedding), so only the ``.mtp.`` head params train. Matters for
-    tied-embedding models (e.g. Qwen3.5), where a trainable shared head lets the draft loss nudge the
-    policy's own logits. Set False to train the shared embedding/head with the draft loss too."""
-    mtp_separate_optimizer: bool = True
-    """Give the MTP/draft head its OWN grad buffer + DistributedOptimizer, fully isolated from
-    the policy's. The decoupled draft loss is autograd-clean, but when the head shares the policy's
-    Megatron DDP grad buffer its mere presence changes the layout — and thus the floating-point result —
-    of the policy gradient's distributed reduction (DP reduce-scatter + TP all-reduce of layernorm
-    grads). That perturbation is deterministic and the RL feedback loop amplifies it into policy-entropy
-    collapse. With this on, the policy's grad buffer and reduction are byte-identical to a model built
-    with no MTP head, while the head still co-trains at full strength. Only used when MTP heads are
-    active. See skyrl/backends/skyrl_train/mtp/mtp_optim.py."""
+    """Weight ``w`` of the draft loss in ``policy_loss + w * draft_loss``. The draft loss is fully
+    decoupled: trunk, re-embedding, output weight and teacher are all detached, so its gradient
+    reaches only the ``.mtp.`` head params. Only used when MTP heads are active."""
     mtp_loss_chunk_size: Optional[int] = 1024
     """Sequence-chunk size for the draft loss, with gradient checkpointing, to bound peak memory at
     large vocab (e.g. Qwen3.5's 248K, where the full-sequence softmax OOMs). Numerically identical to

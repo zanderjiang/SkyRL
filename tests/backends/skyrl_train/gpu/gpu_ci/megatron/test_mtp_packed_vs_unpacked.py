@@ -83,7 +83,7 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
         def soft_ce_over_depths(main_logits, students, mask, mask_fn, vp=False):
             out = []
             for k, st in enumerate(students):
-                teacher = build_teacher_logits(main_logits, k, detach=True)
+                teacher = build_teacher_logits(main_logits, k)
                 lm = mask_fn(mask, k)
                 out.append(
                     draft_soft_ce(
@@ -107,7 +107,7 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
             S = seq.shape[1]
             pos = torch.arange(S, device=device).unsqueeze(0)
             am = torch.ones_like(seq)
-            cap = MTPHiddenCapture(self.actor_module[0], detach_trunk=True)
+            cap = MTPHiddenCapture(self.actor_module[0])
             with torch.no_grad(), cap.capture():
                 out = self.actor_module[0](seq, pos, am)
                 st_hidden = cap.compute_student_hidden_states()
@@ -146,7 +146,7 @@ class _ProbeMegatronPolicyWorker(MegatronPolicyWorkerBase):
         inforward = {}
         mtp = host.mtp
         hh = mtp.register_forward_hook(lambda _m, _i, o: inforward.__setitem__("out", o.detach()))
-        cap = MTPHiddenCapture(self.actor_module[0], detach_trunk=True)
+        cap = MTPHiddenCapture(self.actor_module[0])
         try:
             with torch.no_grad(), cap.capture():
                 out = self.actor_module[0](new_sequences, new_position_ids, new_attention_mask)

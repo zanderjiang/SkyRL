@@ -78,20 +78,12 @@ TIS_TYPE=token
 # the head never trains on its own outputs). Here k=3.
 MTP_ENABLED=true
 MTP_NUM_SPECULATIVE_TOKENS=3
-MTP_LOSS_TYPE="soft_ce" # "soft_ce" (distill against policy) | "hard_ce" (ground-truth next tokens)
 MTP_LOSS_WEIGHT=0.2
-# NOTE: trainer.policy.megatron_config.mtp_detach_shared_output defaults to true. MiMo has UNTIED
-# embeddings, so this detaches the (separate) output_layer.weight passed into the draft projection,
-# along with the MTP block's re-embedding, so the draft gradient trains ONLY the MTP-head params and
-# never nudges the policy's own logits. Set it to false for the old NeMo-RL behaviour (shared head
-# also trained by the draft loss).
+# NOTE: the draft loss trains ONLY the MTP-head params -- trunk, re-embedding, output weight and
+# teacher are all detached. (MiMo is untied, so the detached output weight is its own output_layer.)
 # Top-k draft loss: distill only the teacher's top-k tokens instead of the full vocab, keeping
-# draft-loss memory at O(seq*k) vs O(seq*vocab). Only applies to mtp_loss_type="soft_ce". Here k=256.
+# draft-loss memory at O(seq*k) vs O(seq*vocab). Here k=256.
 MTP_LOSS_TOPK=256
-# Train the MTP head in the policy's native DDP buffer + optimizer (no separate MTP buffer); the
-# native MTP loss stays patched off and the draft loss stays autograd-decoupled, so no MTP grad
-# reaches the policy -- only the ~ulp-level (DP>=3) grad-buffer reduction reordering is given up.
-MTP_SEPARATE_OPTIMIZER=false
 
 
 # MiMo flags -- plain Qwen2-style dense attention (no GDN), so sample packing is supported and no
@@ -169,10 +161,8 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.mtp.enabled=$MTP_ENABLED \
   trainer.mtp.num_speculative_tokens=$MTP_NUM_SPECULATIVE_TOKENS \
-  trainer.mtp.loss_type=$MTP_LOSS_TYPE \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \
   trainer.policy.megatron_config.mtp_loss_topk=$MTP_LOSS_TOPK \
-  trainer.policy.megatron_config.mtp_separate_optimizer=$MTP_SEPARATE_OPTIMIZER \
   trainer.logger="$LOGGER" \
   trainer.project_name="mimo_7b_rl_dapo" \
   trainer.run_name="sd_dapo_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}" \

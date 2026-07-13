@@ -3,6 +3,7 @@
 uv run --isolated --extra dev pytest tests/backends/skyrl_train/mtp/test_soft_ce.py
 """
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -190,6 +191,25 @@ def test_soft_ce_respects_mask():
     a = draft_soft_ce(student, teacher, mask)
     b = draft_soft_ce(student, teacher_alt, mask)
     assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_draft_losses_reject_attached_teacher():
+    # The teacher is the policy's own distribution; an attached one would train the policy through the
+    # draft loss. draft_soft_ce's non-vocab-parallel path uses plain ops and would propagate it
+    # silently, so both losses assert the caller detached it.
+    from skyrl.backends.skyrl_train.mtp.soft_ce import draft_soft_ce_topk
+
+    student = torch.randn(1, 3, 6, requires_grad=True)
+    attached_teacher = torch.randn(1, 3, 6, requires_grad=True)
+    mask = torch.ones(1, 3)
+    for loss_fn in (
+        lambda: draft_soft_ce(student, attached_teacher, mask),
+        lambda: draft_soft_ce_topk(student, attached_teacher, mask, k=3),
+    ):
+        with pytest.raises(AssertionError, match="must be detached"):
+            loss_fn()
+    # A detached teacher is accepted.
+    draft_soft_ce(student, attached_teacher.detach(), mask)
 
 
 def test_build_teacher_logits_rolls_and_detaches():

@@ -45,7 +45,6 @@ TIS_IMP_RATIO_CAP=2.0
 # at default => inferred from MiMo's HF config (1 native head). k>1 reuses that head autoregressively.
 MTP_ENABLED=true
 MTP_NUM_SPECULATIVE_TOKENS=3
-MTP_LOSS_TYPE="soft_ce"   # distill against the policy's own detached next-token distribution
 MTP_LOSS_WEIGHT=0.5
 MTP_LOSS_TOPK=256         # top-k draft loss: O(seq*k) memory vs O(seq*vocab)
 
@@ -122,7 +121,6 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   environment.skyrl_gym.search.topk=3 \
   trainer.mtp.enabled=$MTP_ENABLED \
   trainer.mtp.num_speculative_tokens=$MTP_NUM_SPECULATIVE_TOKENS \
-  trainer.mtp.loss_type=$MTP_LOSS_TYPE \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \
   trainer.policy.megatron_config.mtp_loss_topk=$MTP_LOSS_TOPK \
   trainer.logger="wandb" \
