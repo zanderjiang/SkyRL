@@ -244,7 +244,7 @@ def _apply_mtp_config(cfg: SkyRLTrainConfig):
     # model's HF config; MegatronWorker fails loud if it resolves to zero while MTP is enabled).
     mcfg.mtp_loss_weight = mtp.loss_weight
 
-    # SKYRL_DISABLE_SPEC=1: keep MTP head training on but leave vLLM rollout plain autoregressive.
+    # SKYRL_DISABLE_SPEC=1: train the MTP heads, but keep the vLLM rollout plain autoregressive.
     if os.environ.get("SKYRL_DISABLE_SPEC") == "1":
         return
 
@@ -785,8 +785,6 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "UV_LINK_MODE",
         "UV_PYTHON",
         "UV_OFFLINE",
-        "MTP_DEBUG",
-        "MTP_PROFILE",
         "PYTORCH_CUDA_ALLOC_CONF",
         # Debug/trace knobs — forwarded so they reach the worker actors, not just the driver.
         "CUDA_LAUNCH_BLOCKING",

@@ -1,4 +1,3 @@
-import os
 from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -52,9 +51,6 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     compute_minibatch_rollout_logprob_diff_metrics,
 )
 from skyrl.train.config import TrainerConfig
-
-# One-shot guard for the MTP_PROFILE diagnostic capture (see forward_backward_mini_batch).
-_MTP_PROFILE_DONE = False
 
 
 def _build_packed_targets(
@@ -505,25 +501,6 @@ class MegatronModelWrapper:
                 and getattr(model_config, "cuda_graph_impl", "none") in (None, "none")
             ), "MTP draft training uses forward hooks and cannot be combined with Megatron CUDA graphs"
 
-        if os.environ.get("MTP_DEBUG"):
-            from megatron.core.utils import unwrap_model as _uw
-
-            from skyrl.backends.skyrl_train.mtp.hidden_capture import _resolve_mtp_host
-
-            _gm = _uw(self.actor_module[0])
-            _host = _resolve_mtp_host(_gm)
-            _lm = getattr(_gm, "language_model", None)
-            print(
-                f"[MTP_DEBUG] forward_only={forward_only} mtp_enabled={mtp_enabled} "
-                f"model_config.mtp_num_layers={getattr(model_config, 'mtp_num_layers', 'MISSING')} "
-                f"unwrapped_type={type(_gm).__name__} top_has_mtp={getattr(_gm, 'mtp', None) is not None} "
-                f"has_language_model={_lm is not None} "
-                f"lm_has_mtp={getattr(_lm, 'mtp', None) is not None if _lm is not None else 'NA'} "
-                f"resolved_host={type(_host).__name__} host_mtp_is_none={getattr(_host, 'mtp', None) is None} "
-                f"host_mtp_process={getattr(_host, 'mtp_process', 'MISSING')}",
-                flush=True,
-            )
-
         # Resolve loss function
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
         if loss_fn is not None:
@@ -898,8 +875,6 @@ class MegatronModelWrapper:
             return loss, metrics
 
         def forward_step(batch_iter, model):
-            if prof is not None:
-                prof.step()
             # NOTE(Charlie): despite the name, methods like `remove_left_padding()` are padding-agnostic
             # (can be left, or right) as it uses attention_mask to locate real tokens. Same thing
             # for recover_left_padding and setup_per_microbatch_replay_forward. Especially relevant
@@ -1002,6 +977,11 @@ class MegatronModelWrapper:
                     "MTP/draft training does not support context parallelism "
                     "(context_parallel_size > 1): the teacher/label roll is CP-unaware."
                 )
+                # NOTE (Alex): PP not supported yet -- the MTP block runs on the last stage, but the
+                # ids it re-embeds are only laid out for the first stage.
+                assert (
+                    mpu.get_pipeline_model_parallel_world_size() == 1
+                ), "MTP/draft training does not support pipeline parallelism (pipeline_model_parallel_size > 1)."
                 # The fused LM-head path never materializes the main logits (its output_processor
                 # returns decoder hidden states), but the draft loss distills against exactly those
                 # logits as its teacher -- so the two cannot run together.
@@ -1068,52 +1048,15 @@ class MegatronModelWrapper:
         # batch should be a list of micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
 
-        # MTP_PROFILE=1: one-shot torch.profiler capture of steady-state microbatches (~9-13) of
-        # the first training mini-batch, for diagnosing the draft-path slowdown. Writes a per-rank
-        # kernel table to /tmp/mtp_prof_rank<R>.txt (+ a chrome trace from rank 0).
-        prof = None
-        global _MTP_PROFILE_DONE
-        if os.environ.get("MTP_PROFILE") and not forward_only and not _MTP_PROFILE_DONE and len(micro_batches) >= 14:
-            _MTP_PROFILE_DONE = True
-            from torch.profiler import ProfilerActivity, profile, schedule
-
-            _rank = torch.distributed.get_rank()
-
-            def _dump_profile(p):
-                path = f"/tmp/mtp_prof_rank{_rank}.txt"
-                with open(path, "w") as f:
-                    f.write(
-                        p.key_averages(group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=40)
-                    )
-                    f.write("\n\n===== by stack =====\n")
-                    f.write(p.key_averages(group_by_stack_n=12).table(sort_by="self_cuda_time_total", row_limit=10))
-                if _rank == 0:
-                    p.export_chrome_trace("/tmp/mtp_prof_rank0_trace.json")
-                print(f"[MTP_PROFILE] wrote {path}", flush=True)
-
-            prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(wait=8, warmup=2, active=3, repeat=1),
-                record_shapes=True,
-                with_stack=True,
-                on_trace_ready=_dump_profile,
-            )
-
-        if prof is not None:
-            prof.start()
-        try:
-            metrics_list = forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=batch_generator,
-                model=self.actor_module,
-                num_microbatches=len(micro_batches),
-                seq_length=seq_len,
-                micro_batch_size=micro_batch_size,
-                forward_only=forward_only,
-            )
-        finally:
-            if prof is not None:
-                prof.stop()
+        metrics_list = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=self.actor_module,
+            num_microbatches=len(micro_batches),
+            seq_length=seq_len,
+            micro_batch_size=micro_batch_size,
+            forward_only=forward_only,
+        )
 
         # The decoupled MTP/draft loss is computed and logged per-microbatch inside loss_func
         # (metric key "mtp_loss"); no MTPLossLoggingHelper plumbing is needed.
