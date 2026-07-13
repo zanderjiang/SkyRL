@@ -142,7 +142,6 @@ async def evaluate(
                 eval_metrics,
             )
 
-    # Rollout-only time, used as the vLLM throughput denominator on eval steps.
     eval_metrics["timing/eval_generate"] = eval_generate_time
     return eval_metrics
 

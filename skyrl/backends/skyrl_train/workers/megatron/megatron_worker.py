@@ -386,12 +386,6 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
 
-        Args:
-            enable_mtp: When True (policy worker), honor Multi-Token Prediction (MTP) heads —
-                either from ``megatron_config.mtp_num_layers`` or, if that is None, from the
-                model's own HF config (``num_nextn_predict_layers``). When False (ref worker /
-                inference-only flows), force MTP off so the extra layers are neither built nor run.
-
         ``bridge_weights_path`` (fake-INT4 QAT): when set, the Megatron-Bridge loads
         its BF16 master weights from this path instead of ``model_path``. Used when
         ``model_path`` is a compressed-tensors INT4 checkpoint (which the bridge
@@ -501,14 +495,11 @@ class MegatronWorker:
             setattr(provider, k, v)
 
         # MTP head count: megatron-bridge infers provider.mtp_num_layers from the model's HF config.
-        # ref worker (enable_mtp=False) forces off; an explicit mtp_num_layers
-        # overrides (0 disables); None keeps the bridge's inferred count.
         if not enable_mtp:
             provider.mtp_num_layers = None
         elif megatron_config.mtp_num_layers is not None:
             provider.mtp_num_layers = megatron_config.mtp_num_layers or None
-        # MTP training requires the model to resolve to >= 1 head, else the draft loss silently
-        # no-ops (the wrapper keys off model_config.mtp_num_layers) -- fail loud instead.
+        # MTP training requires the model to resolve to >= 1 head
         mtp_cfg = getattr(self.cfg, "mtp", None)
         if (
             enable_mtp
@@ -523,9 +514,8 @@ class MegatronWorker:
                 "policy.megatron_config.mtp_num_layers to force-build fresh heads."
             )
         if getattr(provider, "mtp_num_layers", None):
-            # Heads stay built (for HF/vLLM weight round-trip) but SkyRL trains them with its own
-            # decoupled loss. Disable Megatron's native in-forward MTP loss (must run before any
-            # forward) or it back-props into the policy trunk and collapses entropy. See native_loss_patch.py.
+            # Disable Megatron's native in-forward MTP loss (must run before any forward)
+            # or it back-props into the policy trunk and collapses entropy. See native_loss_patch.py.
             from skyrl.backends.skyrl_train.mtp.native_loss_patch import (
                 disable_native_mtp_loss,
             )
@@ -970,10 +960,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 num_training_steps=num_training_steps,
             )
 
-            # The MTP head shares the policy's grad buffer + optimizer, but its soft-CE grads are
-            # ~20-30 per microbatch at weight 1.0 -- in Megatron's single global grad-norm they
-            # dominate the clip and shrink the policy update ~20x. Clip the head by its own norm
-            # instead (see mtp/grad_clip.py). Installed on every rank: the norms are collective.
             if getattr(self.provider, "mtp_num_layers", None):
                 from skyrl.backends.skyrl_train.mtp.grad_clip import (
                     install_mtp_separate_grad_clip,
@@ -1650,7 +1636,6 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             self.cfg.ref.megatron_config.transformer_config_kwargs,
             bf16=self.cfg.bf16,
             flash_attn=self.cfg.flash_attn,
-            # Ref worker only needs main-model logprobs; MTP heads are irrelevant here.
             enable_mtp=False,
             language_model_only=self.cfg.ref.language_model_only,
             bridge_weights_path=bridge_weights_path,

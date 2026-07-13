@@ -764,10 +764,8 @@ class InferenceEngineConfig(BaseConfig):
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine. Names must match the engine's args."""
     speculative_config: Optional[Dict[str, Any]] = None
-    """Speculative-decoding config passed through to vLLM (``AsyncEngineArgs.speculative_config``),
-    e.g. ``{"method": "mtp", "num_speculative_tokens": 1}`` for MTP draft decoding. With
-    ``method="mtp"`` vLLM loads the MTP heads from the policy checkpoint, kept in sync by weight sync
-    (needs ``policy.megatron_config.mtp_num_layers`` > 0 to train them). ``None`` disables it."""
+    """Speculative-decoding config passed through to vLLM for MTP drafter decoding. 
+    (needs ``policy.megatron_config.mtp_num_layers`` > 0 to train mtp). ``None`` disables it."""
     external_proxy_url: Optional[str] = None
     """Data-plane URL (load-balanced router) for the new inference layer."""
     external_server_urls: Optional[List[str]] = None
@@ -859,13 +857,6 @@ class EnvironmentConfig(BaseConfig):
 
 @dataclass
 class MTPConfig(BaseConfig):
-    """High-level, single user-facing knob for Multi-Token Prediction (MTP).
-
-    When ``enabled``, ``validate_cfg`` propagates it to the training side
-    (``policy.megatron_config.mtp_*``) and the inference side
-    (``generator.inference_engine.speculative_config``), and weight sync keeps the heads tracking the
-    policy. The trunk hidden states feeding the heads are always detached, so it is not a tunable."""
-
     enabled: bool = False
     """Whether to train MTP draft heads and use them for speculative decoding."""
     num_speculative_tokens: int = 1
