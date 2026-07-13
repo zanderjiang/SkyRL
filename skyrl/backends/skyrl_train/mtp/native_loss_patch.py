@@ -33,9 +33,7 @@ def _skyrl_skip_native_mtp_loss(hidden_states, *args, **kwargs):
 
 
 def _forbid_native_mtp_loss_autoscaler(*args, **kwargs):
-    raise RuntimeError(
-        "Megatron's native MTP loss reached MTPLossAutoScaler.apply"
-    )
+    raise RuntimeError("Megatron's native MTP loss reached MTPLossAutoScaler.apply")
 
 
 def disable_native_mtp_loss() -> None:
@@ -44,8 +42,7 @@ def disable_native_mtp_loss() -> None:
         from megatron.core.transformer import multi_token_prediction as mtp_mod
     except ImportError as e:
         raise RuntimeError(
-            "Cannot disable native MTP loss: megatron.core.transformer.multi_token_prediction "
-            "is not importable."
+            "Cannot disable native MTP loss: megatron.core.transformer.multi_token_prediction " "is not importable."
         ) from e
 
     original = getattr(mtp_mod, "process_mtp_loss", None)

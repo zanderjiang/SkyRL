@@ -87,7 +87,6 @@ TIS_TYPE=token
 # special vLLM prefill backend is needed.
 REMOVE_MICROBATCH_PADDING=true
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
-export _SKYRL_USE_NEW_INFERENCE=0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \

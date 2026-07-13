@@ -55,7 +55,6 @@ DISTRIBUTED_EXECUTOR_BACKEND="mp"
 ENFORCE_EAGER=true  # cuda graphs can cause instability with weight sync
 # New inference server path: MTP speculative decoding (drafter weight-sync + acceptance metrics via
 # the vLLM Prometheus scraper) is supported here.
-export _SKYRL_USE_NEW_INFERENCE=1
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 RUN_NAME="sd_search_mimo_7b_rl_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_k${MTP_NUM_SPECULATIVE_TOKENS}"

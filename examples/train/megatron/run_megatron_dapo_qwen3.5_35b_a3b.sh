@@ -1,18 +1,23 @@
 set -x
 
 # Colocated DAPO training+generation for Qwen3.5-35B-A3B-Base on DAPO with Megatron.
-# Should run on 2 node of 8xH100s
+# Runs on 1 node of 8xH100s, with sample packing (remove_microbatch_padding=true).
+#
+# Sample packing note: Qwen3.5 has GDN (GatedDeltaNet) layers. Sample packing is only
+# safe here because language_model_only=True routes the model through the native GPTModel
+# GDN THD packing path; the Qwen3VL bridge would double-pack and corrupt the GDN cu_seqlens.
 
 # bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # bash examples/train/megatron/run_megatron_dapo_qwen3.5_35b_a3b.sh
 
 MODEL_NAME="Qwen/Qwen3.5-35B-A3B-Base"
-DATA_DIR="$HOME/data/dapo"
+DATA_DIR="/mnt/local_storage/data/dapo"  # cleaned parquets already staged on the fast local disk
 TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
 TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
-NUM_NODES=2
+NUM_NODES=1
 NUM_GPUS_PER_NODE=8
-NUM_INFERENCE_ENGINES=2
+# Colocated on a single node: 1 engine * TP8 = 8 GPUs (was 2 engines on 2 nodes).
+NUM_INFERENCE_ENGINES=1
 INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=8
 LOGGER="wandb"  # change to "console" to print to stdout
 
@@ -60,11 +65,14 @@ OPTIMIZER_OFFLOAD=true
 OPTIMIZER_OFFLOAD_FRACTION=1.0
 
 
+# sample packing (THD): packs multiple sequences per microbatch for better throughput.
+# Only safe with language_model_only=True (native GPTModel GDN packing path) below.
+REMOVE_MICROBATCH_PADDING=true
+
 # Qwen3.5 flags
 LANGUAGE_MODEL_ONLY=True # qwen3-vl in megatron has a separate sequence packing path - if using language_model_only, use the native GPTModel + GDN thd packing path
 ENGINE_INIT_KWARGS='{"gdn_prefill_backend": "triton"}' # see https://github.com/vllm-project/vllm/issues/36921#issuecomment-4109702738
 DISTRIBUTED_EXECUTOR_BACKEND="mp"
-export _SKYRL_USE_NEW_INFERENCE=0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 # On Blackwell, use the following env vars:
@@ -110,6 +118,7 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=$OPTIMIZER_OFFLOAD_FRACTION \
   trainer.algorithm.off_policy_correction.tis_ratio_type=$TIS_TYPE \
   trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
+  trainer.remove_microbatch_padding=$REMOVE_MICROBATCH_PADDING \
   trainer.epochs=20 \
   trainer.algorithm.eps_clip_low=$CLIP_RATIO_LOW \
   trainer.algorithm.eps_clip_high=$CLIP_RATIO_HIGH \
@@ -131,14 +140,13 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=false \
   generator.batched=true \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.eval_n_samples_per_prompt=$EVAL_N_SAMPLES_PER_PROMPT \
   generator.inference_engine.gpu_memory_utilization=0.7 \
   trainer.logger="$LOGGER" \
-  trainer.project_name="qwen3_5_dapo" \
+  trainer.project_name="qwen3_5_35b_dapo" \
   trainer.run_name="dapo_qwen3_5_35b_a3b_base_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_ep${MEGATRON_EP}_etp${MEGATRON_ETP}" \
   trainer.export_path="$HOME/exports/dapo_qwen3_5_35b_a3b_base_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_ep${MEGATRON_EP}_etp${MEGATRON_ETP}" \
   trainer.hf_save_interval=300 \
