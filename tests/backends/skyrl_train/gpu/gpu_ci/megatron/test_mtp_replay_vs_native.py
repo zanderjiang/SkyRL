@@ -164,6 +164,9 @@ def _cfg():
     cfg.trainer.logger = "console"
     cfg.trainer.placement.colocate_all = False
     cfg.trainer.placement.policy_num_gpus_per_node = 1
+    # This probe compares the replayed vs in-forward MTP output on a single unpacked sequence;
+    # packing is irrelevant here and the Qwen3.5 VL bridge rejects it (it packs internally).
+    cfg.trainer.remove_microbatch_padding = False
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.context_parallel_size = 1

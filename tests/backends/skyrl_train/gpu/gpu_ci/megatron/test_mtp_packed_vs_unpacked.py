@@ -200,6 +200,13 @@ def _cfg():
     cfg.trainer.placement.colocate_all = False
     cfg.trainer.placement.policy_num_gpus_per_node = tp
     cfg.trainer.placement.ref_num_gpus_per_node = tp
+    # Qwen3.5 dispatches to the VL bridge (Qwen3VLModel), which packs sequences inside its own
+    # forward -- SkyRL packing on top of that double-packs and corrupts the GDN cu_seqlens, so the
+    # wrapper rejects it. language_model_only routes to the native GPTModel GDN packing path, which
+    # is what the real recipes use and what this test needs (it exercises the packed path).
+    cfg.trainer.policy.language_model_only = True
+    cfg.trainer.ref.language_model_only = True
+    cfg.generator.inference_engine.language_model_only = True
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = 1
     cfg.trainer.policy.megatron_config.context_parallel_size = 1
