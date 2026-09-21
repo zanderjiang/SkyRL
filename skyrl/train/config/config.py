@@ -1388,6 +1388,9 @@ class MTPConfig(BaseConfig):
 
 @dataclass
 class TrainerConfig(BaseConfig):
+    enable_isoexec: bool = False
+    """Use the shared IsoExec model and mandatory exact rollout/trainer score gate."""
+
     placement: PlacementConfig = field(default_factory=PlacementConfig)
     use_expandable_segments: bool = True
     """Enable PyTorch's CUDA ``expandable_segments`` allocator on the training workers.

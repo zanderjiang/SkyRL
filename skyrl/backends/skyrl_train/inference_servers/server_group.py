@@ -149,6 +149,11 @@ class ServerGroup:
         # child vLLM workers). Currently just the expandable_segments allocator, which is
         # safe with sleep mode on vLLM >= 0.20.1.
         runtime_env = build_engine_runtime_env(use_expandable_segments=self._use_expandable_segments)
+        if (getattr(self._cli_args, "additional_config", None) or {}).get("isoexec"):
+            from isoexec.integrations.skyrl.config import engine_runtime_env
+
+            runtime_env = runtime_env or {}
+            runtime_env.setdefault("env_vars", {}).update(engine_runtime_env(self._cli_args))
         return ray.remote(self._server_actor_cls).options(
             num_gpus=0,  # GPU allocation managed by placement group
             num_cpus=COLOCATED_ACTOR_CPU_FRACTION,

@@ -527,6 +527,47 @@ def test_handle_filter_sampling_sufficient_prompts():
     assert all(uid == "uid1" for uid in result_uids)
 
 
+def test_filter_sampling_empty_batches_preserve_accumulation_and_finish():
+    """No-survivor rollouts neither crash nor discard previously useful groups."""
+    output = {
+        "prompt_token_ids": [[1], [1]], "response_ids": [[2], [3]],
+        "rewards": [0.0, 0.0], "loss_masks": [[1], [1]],
+        "stop_reasons": ["stop", "stop"], "rollout_metrics": None,
+        "rollout_logprobs": None,
+    }
+    config = {"train_batch_size": 2, "n_samples_per_prompt": 2}
+    state = {"sample_batch_count": 1}
+    _, _, keep, returned = handle_filter_sampling(output, ["a", "a"], config, state)
+    assert keep and returned is state and state == {"sample_batch_count": 1}
+    good = {**output, "rewards": [0.0, 1.0]}
+    _, _, keep, state = handle_filter_sampling(good, ["b", "b"], config, state)
+    assert keep and state["num_prompts_in_batch"] == 1
+    before = copy.deepcopy(state)
+    _, _, keep, state = handle_filter_sampling(output, ["c", "c"], config, state)
+    assert keep and state == before
+    result, uids, keep, state = handle_filter_sampling(good, ["d", "d"], config, state)
+    assert not keep and state is None
+    assert uids == ["b", "b", "d", "d"]
+    assert result["rewards"] == [0.0, 1.0, 0.0, 1.0]
+
+
+def test_filter_sampling_empty_batches_obey_native_attempt_limit():
+    from types import SimpleNamespace
+    from skyrl.train.trainer import RayPPOTrainer
+
+    cfg = SimpleNamespace(
+        trainer=SimpleNamespace(train_batch_size=2, algorithm=SimpleNamespace(
+            dynamic_sampling=SimpleNamespace(type="filter", max_sample_batches=2, min_replace_ratio=0.5))),
+        generator=SimpleNamespace(n_samples_per_prompt=2),
+    )
+    trainer = SimpleNamespace(cfg=cfg, dynamic_sampling_state=None)
+    output = {"rewards": [0.0, 0.0]}
+    _, _, keep = RayPPOTrainer.handle_dynamic_sampling(trainer, output, ["a", "a"])
+    assert keep and trainer.dynamic_sampling_state["sample_batch_count"] == 1
+    with pytest.raises(RuntimeError, match="2 max sample batches"):
+        RayPPOTrainer.handle_dynamic_sampling(trainer, output, ["b", "b"])
+
+
 def test_handle_filter_sampling_insufficient_prompts_continue():
     """Test filter sampling when we need to continue sampling."""
     generator_output = {

@@ -62,6 +62,7 @@ from typing import (
     TypedDict,
     Union,
 )
+from uuid import uuid4
 
 import aiohttp
 import orjson
@@ -104,6 +105,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# RequestOutputKind.FINAL_ONLY on vLLM's wire protocol. Keep this client usable
+# without importing the serving runtime into the trainer process.
+_VLLM_FINAL_ONLY_OUTPUT_KIND = 2
 
 
 def _extract_session_id_and_body(
@@ -224,6 +229,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
     tokenizer: Optional[Any] = None
     """Optional HF tokenizer for local tokenize/detokenize (avoids HTTP round-trips)."""
 
+    preserve_weights_on_sleep: bool = False
+    """Use level-1 CPU backup when the model's derived state cannot survive level 2."""
+
+    verify_isoexec_weights: bool = False
+    """Verify restored weights and refresh derived layouts after the KV wake."""
+
     # Private fields excluded from repr for cleaner output
     _session: Optional[aiohttp.ClientSession] = field(default=None, repr=False)
     _world_size: Optional[Tuple[int, int]] = field(default=None, repr=False)
@@ -289,7 +300,31 @@ class RemoteInferenceClient(InferenceEngineInterface):
         # aiohttp.ClientSession is tied to the event loop.
         current_loop = asyncio.get_running_loop()
         if self._session is not None and not self._session.closed and self._session.loop != current_loop:
-            # Event loop changed - the old session is unusable (bound to a dead loop).
+            old_session = self._session
+            owner_loop = old_session.loop
+            if owner_loop.is_closed():
+                await old_session.close()
+            else:
+                # aiohttp's close may await transports on the owning loop. Queue
+                # cleanup there, including when that loop is temporarily stopped.
+                # Create the coroutine only when the callback runs: closing the
+                # loop may discard a queued callback without executing it.
+                def close_on_owner():
+                    task = owner_loop.create_task(old_session.close())
+
+                    def report_failure(done):
+                        if not done.cancelled() and (error := done.exception()) is not None:
+                            logger.warning(f"Failed to close stale HTTP session: {error}")
+
+                    task.add_done_callback(report_failure)
+
+                try:
+                    owner_loop.call_soon_threadsafe(close_on_owner)
+                except RuntimeError:
+                    if not owner_loop.is_closed():
+                        raise
+                    # The owner may close between the check and scheduling.
+                    await old_session.close()
             self._session = None
         if self._session is None or self._session.closed:
             # keepalive_timeout must be shorter than the server's timeout_keep_alive
@@ -399,9 +434,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if prompt_token_ids is None:
             raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
 
-        sampling_params = input_batch.get("sampling_params") or {}
+        sampling_params = dict(input_batch.get("sampling_params") or {})
         if sampling_params.get("n", 1) > 1:
             raise ValueError("n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead.")
+        # This batch API returns only completed responses. Cumulative output
+        # would construct and discard growing token/logprob lists every step.
+        sampling_params["output_kind"] = _VLLM_FINAL_ONLY_OUTPUT_KIND
 
         session_ids = input_batch.get("session_ids")
         mm_features = input_batch.get("mm_features")
@@ -443,6 +481,15 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 )
 
         async def _throttled_detokenize(token_ids: List[int]) -> str:
+            if not sampling_params.get("detokenize", True):
+                return ""
+            if self.tokenizer is not None:
+                # The token-only wire response has no engine-rendered text.
+                # Match vLLM's text default without changing public detokenize().
+                return self.tokenizer.decode(
+                    token_ids, skip_special_tokens=sampling_params.get("skip_special_tokens", True)
+                )
+            # The remote /detokenize protocol has no decoding-options fields.
             if detok_sem is None:
                 return (await self.detokenize([token_ids]))[0]
             async with detok_sem:
@@ -493,6 +540,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
             "model": model,
             "token_ids": prompt_token_ids,
         }
+        if self.verify_isoexec_weights:
+            payload["request_id"] = f"{session_id}--{uuid4().hex}"
+            payload["sampling_params"] = {
+                **sampling_params,
+                "extra_args": {**(sampling_params.get("extra_args") or {}), "isoexec_request_id": payload["request_id"]},
+            }
         if mm_features:
             payload["features"] = mm_features
         # `cache_salt` is a top-level request field (forwarded to vLLM's TokensPrompt), not a sampling
@@ -501,10 +554,16 @@ class RemoteInferenceClient(InferenceEngineInterface):
             payload["cache_salt"] = cache_salt
 
         headers = {"Content-Type": "application/json"}
+        if self.verify_isoexec_weights:
+            headers["X-Request-Id"] = payload["request_id"]
         if session_id:
             headers["X-Session-ID"] = str(session_id)
 
         response = await self._post(url, json=payload, headers=headers)
+        if self.verify_isoexec_weights:
+            from isoexec.integrations.skyrl.audit import record_request
+
+            record_request(self, payload, response, session_id)
 
         choice = response["choices"][0]
         token_ids = choice["token_ids"]
@@ -662,7 +721,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         sampling_params: Dict[str, Any] = {
             "n": num_samples,
             "logprobs": 0,
-            "output_kind": 2,
+            "output_kind": _VLLM_FINAL_ONLY_OUTPUT_KIND,
             "prompt_logprobs": prompt_logprobs_sp,
         }
 
@@ -1020,6 +1079,27 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Resume after pause."""
         return await self.resume()
 
+    async def isoexec_refusal_begin_step(self, run_name: str, step: int, request_map: dict) -> dict[str, Any]:
+        from isoexec.integrations.skyrl.audit import begin_requests
+
+        begin_requests(self, run_name, step)
+        return await self._call_all_servers(
+            "/collective_rpc",
+            {"method": "isoexec_refusal_begin_step", "kwargs": {"run_name": run_name, "step": step, "request_map": request_map}},
+        )
+
+    async def isoexec_refusal_end_step(self) -> list[dict[str, Any]]:
+        from isoexec.integrations.skyrl.audit import finish_requests
+
+        responses = await self._call_all_servers("/collective_rpc", {"method": "isoexec_refusal_end_step"})
+        receipts = [receipt for response in responses.values() for receipt in response["body"]["results"]]
+        receipts[0]["request_outputs"] = finish_requests(
+            self,
+            request_aliases=[trace["request_aliases"] for receipt in receipts for trace in receipt["trace"]],
+            mismatch=any(r["verdict"] != "clean" for r in receipts),
+        )
+        return receipts
+
     async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Put all backends to sleep (offload weights to CPU).
@@ -1035,9 +1115,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
         # Mirror BaseVLLMInferenceEngine.sleep: when the trainer syncs LoRA adapters
         # only, force level=1 so the base model survives via CPU backup. level=2
         # discards weights with no source to restore from on wake_up(["weights"]).
-        if self.uses_lora_weight_sync and level != 1:
+        if (self.uses_lora_weight_sync or self.preserve_weights_on_sleep) and level != 1:
             logger.info(
-                "Forcing sleep level=1 (uses_lora_weight_sync=True); requested level=%d would discard the base model.",
+                "Forcing sleep level=1 to preserve model weights and derived state; requested level=%d.",
                 level,
             )
             level = 1
@@ -1055,7 +1135,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 Common tags: ["weights"], ["kv_cache"], or None for all.
         """
         params = {"tags": tags} if tags else {}
-        return await self._call_all_servers("/wake_up", params=params)
+        result = await self._call_all_servers("/wake_up", params=params)
+        if self.verify_isoexec_weights and (not tags or "kv_cache" in tags):
+            await self._call_all_servers("/collective_rpc", {"method": "isoexec_verify_after_wake"})
+        return result
 
     async def sleep_for_weight_sync(self, offload_kv: bool = True) -> Dict[str, Any]:
         """Free GPU memory for weight sync while keeping in-flight requests frozen.
@@ -1078,10 +1161,13 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Wake ``["weights"]`` before the broadcast and ``["kv_cache"]`` after. Does
         not resume generation -- call :meth:`resume_generation` once KV is back.
         """
-        return await self._call_all_servers(
+        result = await self._call_all_servers(
             "/collective_rpc",
             {"method": "skyrl_wake_for_weight_sync", "kwargs": {"tags": tags}},
         )
+        if self.verify_isoexec_weights and "kv_cache" in tags:
+            await self._call_all_servers("/collective_rpc", {"method": "isoexec_verify_after_wake"})
+        return result
 
     async def reset_prefix_cache(
         self,

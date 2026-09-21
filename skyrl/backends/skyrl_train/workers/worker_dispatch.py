@@ -544,6 +544,9 @@ class WorkerDispatch:
 
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer))
 
+    def isoexec_refusal_receipts(self):
+        return ray.get(self._actor_groups["policy"].async_run_ray_method("pass_through", "isoexec_refusal_receipt"))
+
     def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
         """Initialize model from path. Offloads others in colocation group first."""
         # Offload others in colocation group before init

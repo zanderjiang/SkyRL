@@ -266,6 +266,10 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
 
+    if cfg.trainer.enable_isoexec:
+        from isoexec.integrations.skyrl.config import engine_args
+
+        engine_args(cfg, args)
     return args
 
 

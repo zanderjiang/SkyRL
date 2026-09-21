@@ -1049,6 +1049,15 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
             env_vars[var_name] = value
 
+    if cfg.trainer.enable_isoexec:
+        from isoexec.runtimes.environment import resolved_environment
+
+        env_vars.update(resolved_environment(cfg.trainer.policy.model.path))
+        # PIK symmetric-memory rendezvous requires distinct CUDA ordinals across
+        # ranks. Ray's per-actor mask makes every trainer allocation cuda:0.
+        # WorkerBase already selects its Ray-assigned GPU as LOCAL_RANK when
+        # masking is disabled; resource ownership still comes from the PG.
+        env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     return env_vars
 
 
@@ -1125,7 +1134,15 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    runtime_env = {"env_vars": env_vars}
+    if cfg.trainer.enable_isoexec:
+        import sys
+
+        runtime_env["py_executable"] = sys.executable
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto") if cfg.trainer.enable_isoexec else None,
+        runtime_env=runtime_env, log_to_driver=True,
+    )
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")

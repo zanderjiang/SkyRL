@@ -191,6 +191,13 @@ class MegatronModelWrapper:
         self._pending_grad_sync: Optional[dict] = None
 
         config = get_model_config(self.actor_module[0])
+        self._packed_logprobs = from_parallel_logits_to_logprobs_packed_sequences
+        self._forward_kwargs = {}
+        self._finalize_grads = finalize_model_grads
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.scoring import bind
+
+            bind(self, config)
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
@@ -236,7 +243,7 @@ class MegatronModelWrapper:
         """
         pending = self._pending_grad_sync
         self._pending_grad_sync = None
-        finalize_model_grads(self.actor_module, pending["num_tokens"] if pending else None)
+        self._finalize_grads(self.actor_module, pending["num_tokens"] if pending else None)
 
     def train(self):
         [module.train() for module in self.actor_module]
@@ -302,7 +309,12 @@ class MegatronModelWrapper:
 
             # temperature normalization (the fused path applies it inside the op)
             if temperature != 1.0 and not fused_lm_head:
-                logits.div_(temperature)
+                if self.cfg.enable_isoexec:
+                    from isoexec.integrations.skyrl.scoring import scale_logits
+
+                    logits = scale_logits(logits, temperature)
+                else:
+                    logits.div_(temperature)
 
             if fused_lm_head and packed_seq_params is not None and packed_targets is not None:
                 token_logprobs = from_parallel_hidden_to_logprobs_packed_sequences(
@@ -337,7 +349,7 @@ class MegatronModelWrapper:
                     fused_backend=self._fused_lm_head_backend,
                 )
             elif packed_seq_params is not None and packed_targets is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                token_logprobs = self._packed_logprobs(
                     logits,
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
@@ -457,6 +469,7 @@ class MegatronModelWrapper:
                     packed_seq_params=packed_seq_params,
                     output_processor=fused_lm_head_output_processor,
                     output_processor_context=_op_ctx,
+                    **self._forward_kwargs,
                     **model_replay_kwargs,
                     **vlm_inputs,
                 )
@@ -467,6 +480,7 @@ class MegatronModelWrapper:
                     new_position_ids,
                     to_te_attention_mask(new_attention_mask),
                     packed_seq_params=packed_seq_params,
+                    **self._forward_kwargs,
                     **model_replay_kwargs,
                     **vlm_inputs,
                 )
@@ -625,7 +639,12 @@ class MegatronModelWrapper:
 
             # temperature normalization (the fused path applies it inside the op)
             if temperature != 1.0 and not fused_lm_head:
-                logits.div_(temperature)
+                if self.cfg.enable_isoexec:
+                    from isoexec.integrations.skyrl.scoring import scale_logits
+
+                    logits = scale_logits(logits, temperature)
+                else:
+                    logits.div_(temperature)
 
             if fused_lm_head and packed_seq_params is not None and packed_targets is not None:
                 token_logprobs = from_parallel_hidden_to_logprobs_packed_sequences(
@@ -660,7 +679,7 @@ class MegatronModelWrapper:
                     fused_backend=self._fused_lm_head_backend,
                 )
             elif packed_seq_params is not None and packed_targets is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                token_logprobs = self._packed_logprobs(
                     logits,
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
@@ -1121,7 +1140,8 @@ class MegatronModelWrapper:
                         packed_seq_params=packed_seq_params,
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
-                        **model_replay_kwargs,
+                        **self._forward_kwargs,
+                    **model_replay_kwargs,
                         **vlm_inputs,
                     )
                     batch["lm_head_weight"] = _op_ctx.get("lm_head_weight")
@@ -1131,7 +1151,8 @@ class MegatronModelWrapper:
                         new_position_ids,
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
-                        **model_replay_kwargs,
+                        **self._forward_kwargs,
+                    **model_replay_kwargs,
                         **vlm_inputs,
                     )
                 # Replay the MTP block on *detached* trunk hidden states (decoupled draft forward)

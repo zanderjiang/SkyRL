@@ -294,13 +294,17 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             if getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
                 _load_checkpoint_weights(model, weights)
             else:
-                for name, weight in weights:
-                    param = model.get_parameter(name)
-                    param.copy_(weight)
+                self._skyrl_load_kernel_weights(weights)
 
         # Ensure consumption of packed_tensor finishes before we return (and
         # before the sender drops its reference on the next barrier).
         torch.accelerator.synchronize()
+
+    def _skyrl_load_kernel_weights(self, weights):
+        """Copy kernel weights; registered model hosts may verify logical streams."""
+        model, _ = self.skyrl_weight_update_target()
+        for name, weight in weights:
+            model.get_parameter(name).copy_(weight)
 
     def update_weights_nccl(self, update_info: dict) -> None:
         """

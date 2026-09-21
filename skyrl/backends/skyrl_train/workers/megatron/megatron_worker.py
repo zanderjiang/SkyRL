@@ -1016,7 +1016,16 @@ class MegatronWorker:
 
         return padded
 
+    def isoexec_refusal_receipt(self):
+        from isoexec.integrations.skyrl.audit import trainer_receipt
+
+        return trainer_receipt(self)
+
     def save_hf_model(self, export_dir: str, tokenizer):
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import save_hf_model
+
+            return save_hf_model(self, export_dir, tokenizer)
         # Save model in HuggingFace safetensors format
         hf_export = self.megatron_config.hf_export_config
         self.strategy.save_hf_model(
@@ -1089,6 +1098,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             seed=self.cfg.seed,
             is_lora=self._is_lora,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -1106,6 +1116,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import init_model
+
+            return init_model(self, model_path, num_training_steps)
+
         # Fake-INT4 QAT: install the MoE expert fake-quant hook and (when the
         # served checkpoint is INT4) redirect the trainer's BF16 master weights.
         bridge_weights_path = self._maybe_setup_fake_int4_qat()
@@ -1242,6 +1257,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         ``metrics``; it has no effect on the inference path.
         """
         if loss_fn is None:
+            if self.cfg.enable_isoexec:
+                from isoexec.integrations.skyrl.scoring import _find_isoexec_stage
+                from isoexec.debug.refusal.weights import check_trainer_scoring
+
+                check_trainer_scoring(_find_isoexec_stage(self.actor_module))
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
             # `_forward_logprobs`, which also reorders back to the original sample order.
@@ -1559,9 +1579,19 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import check_optimizer_update
+
+            check_optimizer_update(self, "before-finalize")
         self.model.run_pending_grad_sync()
+        if self.cfg.enable_isoexec:
+            check_optimizer_update(self, "after-finalize")
 
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import finish_optimizer_step
+
+            finish_optimizer_step(self)
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1620,6 +1650,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # rendezvouses at init (sharded_rdt) is handed this extractor by
         # create_sender. It only depends on
         # the already-built bridge/actor_module, not on super().
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.weights import LogicalWeightExtractor
+
+            self.weight_extractor = LogicalWeightExtractor(self, inference_engine_cfg)
+            await super().init_weight_sync_state(inference_engine_client, inference_engine_cfg)
+            return
         self.weight_extractor = MegatronWeightExtractor(
             bridge=self.bridge,
             actor_module=self.actor_module,
@@ -1900,6 +1936,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             optimizer_config=None,
             seed=self.cfg.seed,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -1923,6 +1960,11 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         bridge_weights_path = self._maybe_setup_fake_int4_qat()
 
         # initialize the bridge and provider objects
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import init_model
+
+            return init_model(self, model_path, num_training_steps, section="ref")
+
         self.init_configs(
             model_path,
             self.cfg.ref.megatron_config,

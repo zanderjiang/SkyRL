@@ -562,6 +562,16 @@ def handle_filter_sampling(
         if traj_uid in kept_uids_set:
             kept_traj_idxs.append(idx)
 
+    # A whole rollout batch may have constant rewards. Keep any previously
+    # collected groups and let the caller's bounded resampling loop continue;
+    # slicing an empty set is invalid for GeneratorOutput.
+    if not kept_traj_idxs:
+        logger.info(
+            "Dynamic sampling: no variable-reward groups in this batch; continue sampling "
+            f"(rewards min={rewards.min():.4g}, mean={rewards.mean():.4g}, max={rewards.max():.4g})"
+        )
+        return generator_output, uids, True, collected_state
+
     # Apply filtering to generator output
     filtered_output = filter_generator_output(generator_output, kept_traj_idxs)
     filtered_uids = [uids[idx] for idx in kept_traj_idxs]

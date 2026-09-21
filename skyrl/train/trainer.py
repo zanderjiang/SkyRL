@@ -114,6 +114,10 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        if cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.config import resolve
+
+            resolve(cfg)
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -356,10 +360,21 @@ class RayPPOTrainer:
                         )
 
                         # 1.1. generation phase
+                        if self.cfg.trainer.enable_isoexec:
+                            await self.inference_engine_client.isoexec_refusal_begin_step(
+                                self.cfg.trainer.run_name,
+                                self.global_step,
+                                {
+                                    f"{tid.instance_id}_{tid.repetition_id}": {"uid": uid, "batch_idx": i}
+                                    for i, (tid, uid) in enumerate(zip(generator_input["trajectory_ids"], uids))
+                                },
+                            )
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.resume()
                         with Timer("generate", self.all_timings):
                             generator_output: GeneratorOutput = await self.generate(generator_input)
+                        if self.cfg.trainer.enable_isoexec and not self.cfg.generator.step_wise_trajectories:
+                            generator_output["trajectory_ids"] = generator_input["trajectory_ids"]
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.pause()
 
@@ -375,6 +390,13 @@ class RayPPOTrainer:
                                 # update progress bar for current batch (but not global step)
                                 pbar.update(1)
                                 continue
+
+                        if self.cfg.trainer.enable_isoexec:
+                            self._isoexec_engine_artifacts = await self.inference_engine_client.isoexec_refusal_end_step()
+                            logger.info(
+                                "IsoExec step {} weight verdicts: {}", self.global_step,
+                                [receipt["verdict"] for receipt in self._isoexec_engine_artifacts],
+                            )
 
                         if self.colocate_all:
                             # if we are not continuing sampling, we sleep the inference engine
@@ -943,6 +965,10 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        if self.cfg.trainer.enable_isoexec:
+            training_input.metadata["request_sessions"] = [
+                f"{tid.instance_id}_{tid.repetition_id}" for tid in generator_output["trajectory_ids"]
+            ]
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1294,6 +1320,8 @@ class RayPPOTrainer:
         is anchor-aware here rather than a static membership in LOSSES_WITHOUT_OLD_LOGPROBS, which is
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
+        if self.cfg.trainer.enable_isoexec:
+            return False
         algorithm = self.cfg.trainer.algorithm
         if algorithm.policy_loss_type == PolicyLossType.CISPO:
             # CISPO reads old logprobs only with the default "old" anchor; "rollout" optimizes against
@@ -1385,6 +1413,10 @@ class RayPPOTrainer:
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
+        if self.cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.audit import require_comparison
+
+            require_comparison(training_input, action_log_probs)
         if training_input.get("rollout_logprobs", None) is not None and action_log_probs is not None:
             # Abs diff between rollout and forward-pass logprobs, over response tokens. When the
             # forward pass is skipped, the worker's `minibatch_rollout_logprobs_abs_diff_*` is used.
@@ -1392,6 +1424,12 @@ class RayPPOTrainer:
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
                 - action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
+
+            if self.cfg.trainer.enable_isoexec:
+                from isoexec.integrations.skyrl.audit import check_training_batch
+
+                check_training_batch(self, training_input, action_log_probs, logprobs_diff,
+                                     save_trainer_weights=self._isoexec_save_refusal_weights)
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
             # response dropped by overlong filtering) leaves logprobs_diff empty, and .max()/.min()
@@ -1410,6 +1448,10 @@ class RayPPOTrainer:
                     }
                 )
         return training_input
+
+    def _isoexec_save_refusal_weights(self, path):
+        self.dispatch.save_hf_model("policy", str(path), self.tokenizer)
+        return {"format": "huggingface", "policy_step": self.global_step, "optimizer_updated": False}
 
     def apply_reward_kl_penalty(
         self,

@@ -718,6 +718,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         max_tokens: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         cache_salt: Optional[str] = None,
+        trajectory_ids: Optional[List[TrajectoryID]] = None,
     ) -> GeneratorOutput:
         """
         Single-turn batched generation (can use the synchronous offline engine)
@@ -750,7 +751,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             return_dict=False,
         )
         engine_input = InferenceEngineInput(
-            prompt_token_ids=prompt_token_ids, sampling_params=sampling_params, cache_salt=cache_salt
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            cache_salt=cache_salt,
+            session_ids=[f"{tid.instance_id}_{tid.repetition_id}" for tid in trajectory_ids] if trajectory_ids else None,
         )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
         outputs = engine_output["responses"]
@@ -835,7 +839,10 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         if self.batched:
             return await self.generate_batched(
-                prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt
+                prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt,
+                trajectory_ids=(
+                    trajectory_ids if getattr(self.inference_engine_client, "_isoexec_requests", None) else None
+                ),
             )
 
         # Async agent loop to generate trajectories in parallel.

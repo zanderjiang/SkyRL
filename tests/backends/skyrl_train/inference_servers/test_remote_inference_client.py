@@ -30,6 +30,136 @@ from skyrl.backends.skyrl_train.inference_servers.setup import (
 from skyrl.train.config import SkyRLTrainConfig
 
 
+def test_session_is_closed_when_recreated_on_a_new_event_loop():
+    client = RemoteInferenceClient(
+        proxy_url="http://localhost:8000", server_urls=["http://localhost:8000"], data_parallel_size=1
+    )
+    old = asyncio.run(client._get_session())
+    try:
+        new = asyncio.run(client._get_session())
+        assert new is not old
+        assert old.closed
+        assert not new.closed
+    finally:
+        asyncio.run(client.teardown())
+
+
+@pytest.mark.parametrize("owner_state", ["stopped", "running", "closed", "wrapper", "wrapper_error"])
+def test_pooled_session_cleanup_runs_on_its_owner_loop(owner_state):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    owner = asyncio.new_event_loop()
+    owner_thread = None
+    owner_running = owner_state == "running"
+    client = RemoteInferenceClient(
+        proxy_url=f"http://127.0.0.1:{server.server_port}",
+        server_urls=[f"http://127.0.0.1:{server.server_port}"],
+        data_parallel_size=1,
+    )
+
+    async def connect():
+        session = await client._get_session()
+        async with session.get(client.proxy_url) as response:
+            assert await response.read() == b"ok"
+        assert session.connector._conns  # A real keep-alive transport awaits cleanup.
+        return session
+
+    async def wait_closed(session):
+        async with asyncio.timeout(5):
+            while not session.closed:
+                await asyncio.sleep(0.01)
+
+    old = None
+    try:
+        if owner_running:
+            owner_thread = threading.Thread(target=owner.run_forever, daemon=True)
+            owner_thread.start()
+            old = asyncio.run_coroutine_threadsafe(connect(), owner).result(timeout=5)
+        elif owner_state.startswith("wrapper"):
+            from skyrl.train.entrypoints.main_base import _run_with_http_client_cleanup
+
+            captured = {}
+
+            async def operation():
+                captured["session"] = await connect()
+                captured["socket"] = next(iter(captured["session"].connector._conns.values()))[0][
+                    0
+                ].transport.get_extra_info("socket")
+                if owner_state == "wrapper_error":
+                    raise ValueError("operation failed")
+                return "operation succeeded"
+
+            if owner_state == "wrapper_error":
+                with pytest.raises(ValueError, match="operation failed"):
+                    owner.run_until_complete(_run_with_http_client_cleanup(operation, client))
+            else:
+                assert (
+                    owner.run_until_complete(_run_with_http_client_cleanup(operation, client)) == "operation succeeded"
+                )
+            old = captured["session"]
+            assert old.closed
+            assert captured["socket"].fileno() == -1  # Closed eagerly, before loop shutdown or GC.
+            assert client._session is None
+            owner.close()
+            return
+        else:
+            old = owner.run_until_complete(connect())
+        pooled_socket = next(iter(old.connector._conns.values()))[0][0].transport.get_extra_info("socket")
+        if owner_state == "closed":
+            owner.close()
+        new = asyncio.run(client._get_session())
+        assert new is not old
+        assert not new.closed
+        if owner_state == "closed":
+            assert old.closed
+            # aiohttp cannot run transport cleanup after loop.close(). The
+            # replacement session works, but final socket cleanup is deferred
+            # to GC and may emit ResourceWarning. Callers should close clients
+            # before closing their loops; do not claim eager socket cleanup.
+            import gc
+            import warnings
+
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always", ResourceWarning)
+                gc.collect()
+            assert pooled_socket.fileno() == -1
+        elif owner_running:
+            asyncio.run_coroutine_threadsafe(wait_closed(old), owner).result(timeout=5)
+        else:
+            assert not old.closed  # Cleanup must wait for its owner to resume.
+            owner.run_until_complete(wait_closed(old))
+        assert old.closed
+    finally:
+        asyncio.run(client.teardown())
+        if old is not None and not old.closed:
+            if owner_running:
+                asyncio.run_coroutine_threadsafe(old.close(), owner).result(timeout=5)
+            else:
+                owner.run_until_complete(old.close())
+        if owner_thread is not None:
+            owner.call_soon_threadsafe(owner.stop)
+            owner_thread.join(timeout=5)
+        owner.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
 def create_mock_vllm_server(server_id: int) -> FastAPI:
     """Create a mock vLLM server with standard endpoints."""
     app = FastAPI()
@@ -330,6 +460,23 @@ async def test_build_new_inference_client_uses_served_model_name_for_chat_reques
         await client.teardown()
 
 
+@pytest.mark.asyncio
+async def test_build_client_honors_isoexec_sleep_capability(mock_servers, monkeypatch):
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.enable_isoexec = True
+    cfg.generator.inference_engine.external_proxy_url = mock_servers["proxy_url"]
+    cfg.generator.inference_engine.external_server_urls = mock_servers["server_urls"]
+    monkeypatch.setattr("isoexec.integrations.skyrl.config.preserve_weights_on_sleep", lambda cfg: True)
+    client, _ = build_new_inference_client(cfg, tokenizer=None)
+    try:
+        assert client.verify_isoexec_weights
+        result = await client.sleep()
+        assert len(result) == 2
+        assert all(response["body"]["level"] == 1 for response in result.values())
+    finally:
+        await client.teardown()
+
+
 def start_server(port: int, server_id: int) -> uvicorn.Server:
     """Start a mock server, return the server instance."""
     app = create_mock_vllm_server(server_id)
@@ -444,6 +591,76 @@ class TestRemoteInferenceClientInit:
 
 class TestDataPlane:
     """Test data plane methods."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("output_kind", [None, 0, 1])
+    async def test_generate_requests_final_output_without_mutating_input(self, client, monkeypatch, output_kind):
+        params = {"max_tokens": 100, "logprobs": 1, "temperature": 0.7}
+        if output_kind is not None:
+            params["output_kind"] = output_kind
+        original_params = dict(params)
+        sent = []
+        original_post = client._post
+
+        async def record_post(url, json, headers=None):
+            if url.endswith("/generate"):
+                sent.append(dict(json["sampling_params"]))
+            return await original_post(url, json=json, headers=headers)
+
+        monkeypatch.setattr(client, "_post", record_post)
+        result = await client.generate({"prompt_token_ids": [[1, 2], [3, 4]], "sampling_params": params})
+        assert params == original_params
+        assert sent == [{**params, "output_kind": 2}] * 2
+        assert result["response_ids"] == [[0, 1, 2], [0, 1, 2]]
+        assert result["response_logprobs"] == [[-0.1], [-0.1]]
+        assert result["stop_reasons"] == ["stop", "stop"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_special_tokens", [None, True, False])
+    @pytest.mark.parametrize("detokenize", [True, False])
+    async def test_generate_text_matches_sampling_decode_options(
+        self, client, monkeypatch, skip_special_tokens, detokenize
+    ):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"answer": 0, "[EOS]": 1, "[UNK]": 2}, unk_token="[UNK]")),
+            eos_token="[EOS]",
+            unk_token="[UNK]",
+        )
+        client.tokenizer = tokenizer
+        params = {"max_tokens": 100, "logprobs": 1, "detokenize": detokenize}
+        if skip_special_tokens is not None:
+            params["skip_special_tokens"] = skip_special_tokens
+        original = dict(params)
+        sent = []
+
+        async def generate_reply(url, json, headers=None):
+            assert url.endswith("/generate")
+            sent.append(dict(json["sampling_params"]))
+            return {
+                "choices": [
+                    {
+                        "token_ids": [0, 1],
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(client, "_post", generate_reply)
+        result = await client.generate({"prompt_token_ids": [[0]], "sampling_params": params})
+        expected = "" if not detokenize else ("answer [EOS]" if skip_special_tokens is False else "answer")
+        assert result["responses"] == [expected]
+        assert result["response_ids"] == [[0, 1]]
+        assert result["response_logprobs"] == [[-0.1, -0.2]]
+        assert result["stop_reasons"] == ["stop"]
+        assert params == original
+        assert sent == [{**params, "output_kind": 2}]
+        # Public token decoding keeps its previous special-token behavior.
+        assert await client.detokenize([[0, 1]]) == ["answer [EOS]"]
 
     @pytest.mark.asyncio
     async def test_generate(self, client):
@@ -613,6 +830,17 @@ class TestControlPlane:
             assert response["body"]["tags"] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("preserve,lora", [(True, False), (False, True)])
+    async def test_sleep_preserves_required_model_state(self, client, preserve, lora):
+        client.preserve_weights_on_sleep = preserve
+        client.uses_lora_weight_sync = lora
+        result = await client.sleep(level=2, tags=["weights"])
+        assert len(result) == 2
+        for response in result.values():
+            assert response["body"]["level"] == 1
+            assert response["body"]["tags"] == ["weights"]
+
+    @pytest.mark.asyncio
     async def test_sleep_with_tags(self, client):
         """Test sleep with tags produces correct repeated query params."""
         result = await client.sleep(level=1, tags=["weights", "kv_cache"])
@@ -636,6 +864,30 @@ class TestControlPlane:
         assert len(result) == 2
         for url, response in result.items():
             assert response["body"]["tags"] == ["weights"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tags,verify,sync_wake",
+        [(None, True, False), (["kv_cache"], True, False), (["weights"], False, False),
+         (["kv_cache"], True, True), (["weights"], False, True)],
+    )
+    async def test_isoexec_verifies_only_after_kv_wake(self, client, monkeypatch, tags, verify, sync_wake):
+        from unittest.mock import AsyncMock, call
+
+        client.verify_isoexec_weights = True
+        rpc = AsyncMock(return_value={"ok": True})
+        monkeypatch.setattr(client, "_call_all_servers", rpc)
+        if sync_wake:
+            result = await client.wake_for_weight_sync(tags)
+            first = call("/collective_rpc", {"method": "skyrl_wake_for_weight_sync", "kwargs": {"tags": tags}})
+        else:
+            result = await client.wake_up(tags)
+            first = call("/wake_up", params={"tags": tags} if tags else {})
+        expected = [first]
+        if verify:
+            expected.append(call("/collective_rpc", {"method": "isoexec_verify_after_wake"}))
+        assert rpc.await_args_list == expected
+        assert result == {"ok": True}
 
     @pytest.mark.asyncio
     async def test_reset_prefix_cache(self, client):
