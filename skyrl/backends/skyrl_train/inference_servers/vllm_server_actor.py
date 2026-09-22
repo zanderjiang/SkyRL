@@ -507,8 +507,6 @@ class VLLMServerActor(ServerActorProtocol):
             else:
                 prompt = TokensPrompt(prompt_token_ids=token_ids)
             request_id = random_uuid()
-            if (getattr(cli_args, "additional_config", None) or {}).get("isoexec"):
-                request_id = body["request_id"]
 
             final_res = None
             async for res in engine.generate(prompt, sampling_params, request_id=request_id):
