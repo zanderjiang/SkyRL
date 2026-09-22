@@ -525,6 +525,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             if mm_features or self.uses_lora_weight_sync:
                 raise ValueError("full logprobs require text-only generation without LoRA")
             sampling_params = {**sampling_params, "logprobs": -1}
+            # The packed diagnostic returns token IDs and float32 values, not decoded
+            # vocabulary strings. Avoid decoding V tokens for every generated token.
+            # String stop conditions still require vLLM's detokenizer.
+            if not sampling_params.get("stop"):
+                sampling_params["detokenize"] = False
         url = (
             f"{self.proxy_url}/skyrl/v1/generate"
             if self.enable_return_routed_experts or full_logprobs

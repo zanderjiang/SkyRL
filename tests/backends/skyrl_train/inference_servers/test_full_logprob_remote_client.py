@@ -13,7 +13,8 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 
 
 @pytest.mark.asyncio
-async def test_full_logprobs_use_skyrl_endpoint_and_decode_rows(monkeypatch):
+@pytest.mark.parametrize("stop", [None, ["stop here"]])
+async def test_full_logprobs_use_skyrl_endpoint_and_decode_rows(monkeypatch, stop):
     pytest.importorskip("isoexec.integrations.full_distribution")
     client = RemoteInferenceClient(
         proxy_url="http://unused",
@@ -41,12 +42,13 @@ async def test_full_logprobs_use_skyrl_endpoint_and_decode_rows(monkeypatch):
         }
 
     monkeypatch.setattr(client, "_post", return_full_rows)
-    sampling_params = {"logprobs": 1, "n": 1}
+    sampling_params = {"logprobs": 1, "n": 1, "stop": stop}
 
     result = await client._generate_single([10], sampling_params, None, "model")
 
     assert captured["url"] == "http://unused/skyrl/v1/generate"
     assert captured["json"]["sampling_params"]["logprobs"] == -1
+    assert captured["json"]["sampling_params"].get("detokenize", True) is bool(stop)
     assert captured["json"]["return_full_logprobs"] is True
     assert sampling_params["logprobs"] == 1
     assert result["response_logprobs"] == [-2.0, -6.0]
