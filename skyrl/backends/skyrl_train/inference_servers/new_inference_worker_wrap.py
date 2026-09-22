@@ -278,8 +278,8 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
                 - ipc_handles_pickled: b64(pickle({gpu_uuid: (func, args)}))
                 - metadata_by_gpu: optional GPU UUID -> names/dtype_names/shapes/sizes
         """
-        if not getattr(self, "_skyrl_weight_update_active", False):
-            raise RuntimeError("skyrl_start_weight_update must be called before update_weights_ipc.")
+        if not getattr(self, "_weight_update_active", False):
+            raise RuntimeError("A weight update session must be started before update_weights_ipc.")
 
         if self.weight_transfer_engine is None:
             raise RuntimeError(
@@ -323,29 +323,22 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         # and vllm only sets that context around init_device / load_model.
         from vllm.config import set_current_vllm_config
 
-        model = self.model_runner.model
+        model, _ = self.skyrl_weight_update_target()
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
-            host_loader = getattr(self, "_skyrl_load_kernel_weights", None)
-            if callable(host_loader):
-                host_loader(weights)
-            elif self._skyrl_is_checkpoint_format:
+            if getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
                 _load_checkpoint_weights(model, weights)
-                # vLLM's load only updates the main model; the spec-decode (MTP/Eagle)
-                # drafter is a separate module and must be reloaded from the same
-                # checkpoint-format weights (see spec_decode_utils).
-                from skyrl.backends.skyrl_train.inference_servers.spec_decode_utils import (
-                    _reload_spec_decode_drafter,
-                )
-
-                _reload_spec_decode_drafter(self.model_runner, weights)
             else:
-                for name, weight in weights:
-                    param = model.get_parameter(name)
-                    param.copy_(weight)
+                self._skyrl_load_kernel_weights(weights)
 
         # Ensure consumption of packed_tensor finishes before we return (and
         # before the sender drops its reference on the next barrier).
         torch.accelerator.synchronize()
+
+    def _skyrl_load_kernel_weights(self, weights):
+        """Copy kernel weights; registered model hosts may verify logical streams."""
+        model, _ = self.skyrl_weight_update_target()
+        for name, weight in weights:
+            model.get_parameter(name).copy_(weight)
 
     def update_weights_nccl(self, update_info: dict) -> None:
         """
@@ -370,8 +363,8 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         weight-sync-fix), then route via the native /update_weights endpoint.
         https://github.com/vllm-project/vllm/pull/42577
         """
-        if not getattr(self, "_skyrl_weight_update_active", False):
-            raise RuntimeError("skyrl_start_weight_update must be called before update_weights_nccl.")
+        if not getattr(self, "_weight_update_active", False):
+            raise RuntimeError("A weight update session must be started before update_weights_nccl.")
 
         if self.weight_transfer_engine is None:
             raise RuntimeError(
@@ -380,40 +373,26 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
 
         from vllm.config import set_current_vllm_config
 
-        from skyrl.backends.skyrl_train.inference_servers.spec_decode_utils import (
-            _reload_spec_decode_drafter,
-        )
-
         engine = self.weight_transfer_engine
         typed_update_info = engine.parse_update_info(update_info)
-        model = self.model_runner.model
-        # A host loader (e.g. IsoExec's applied-byte receiver) owns the received
-        # tensors when present, exactly as update_weights_ipc dispatches; it also
-        # consumes the sender's handshake/version/digest sentinels.
-        host_loader = getattr(self, "_skyrl_load_kernel_weights", None)
+        model, model_config = self.skyrl_weight_update_target()
 
         def _load_weights(weights):
             weights = list(weights)
-            if callable(host_loader):
-                return host_loader(weights)
-            loaded = _load_checkpoint_weights(model, weights)
-            _reload_spec_decode_drafter(self.model_runner, weights)
-            return loaded
+            if getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
+                return _load_checkpoint_weights(model, weights)
+            return self._skyrl_load_kernel_weights(weights)
 
-        # vLLM 0.26 dropped the `load_weights` callback parameter from
-        # WeightTransferEngine.receive_weights; the engines now call
-        # `self.model.load_weights` directly. Retarget the engine at a proxy
-        # whose load_weights is ours (so the spec-decode drafter still gets
-        # reloaded), using vLLM's own set/reset_weight_update_target hooks.
+        # Interpose the batched-MoE FP8 loader, then restore this session's model.
         engine.set_weight_update_target(
             _LoadWeightsProxy(model, _load_weights),
-            self.model_config,
+            model_config,
         )
         try:
             with set_current_vllm_config(self.vllm_config), torch.device(self.device):
                 engine.receive_weights(typed_update_info)
         finally:
-            engine.reset_weight_update_target()
+            engine.set_weight_update_target(model, model_config)
 
         torch.accelerator.synchronize()
         _empty_cuda_cache_rocm()

@@ -106,6 +106,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# RequestOutputKind.FINAL_ONLY on vLLM's wire protocol. Keep this client usable
+# without importing the serving runtime into the trainer process.
+_VLLM_FINAL_ONLY_OUTPUT_KIND = 2
+
 
 def _extract_session_id_and_body(
     request_payload: Dict[str, Any],
@@ -292,15 +296,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
             self._sem_loop = current_loop
         return self._gen_sem, self._detok_sem
 
-    def _drop_closed_loop_sessions(self) -> None:
-        """Forget sessions whose event loop has been closed.
-
-        Such a session cannot be closed from any other loop; dropping the
-        reference lets garbage collection release its sockets.
-        """
+    async def _drop_closed_loop_sessions(self) -> None:
+        """Close sessions whose owning loop has ended, retaining other live loops' pools."""
         for loop in list(self._sessions):
             if loop.is_closed():
-                self._sessions.pop(loop, None)
+                session = self._sessions.pop(loop)
+                await session.close()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the aiohttp session bound to the running event loop.
@@ -309,7 +310,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         closes a session that another live loop (e.g. the Tinker engine's
         continuous sampler thread) is still using.
         """
-        self._drop_closed_loop_sessions()
+        await self._drop_closed_loop_sessions()
         current_loop = asyncio.get_running_loop()
         session = self._sessions.get(current_loop)
         if session is None or session.closed:
@@ -421,9 +422,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if prompt_token_ids is None:
             raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
 
-        sampling_params = input_batch.get("sampling_params") or {}
+        sampling_params = dict(input_batch.get("sampling_params") or {})
         if sampling_params.get("n", 1) > 1:
             raise ValueError("n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead.")
+        # This batch API returns only completed responses. Cumulative output
+        # would construct and discard growing token/logprob lists every step.
+        sampling_params["output_kind"] = _VLLM_FINAL_ONLY_OUTPUT_KIND
 
         session_ids = input_batch.get("session_ids")
         mm_features = input_batch.get("mm_features")
@@ -465,6 +469,15 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 )
 
         async def _throttled_detokenize(token_ids: List[int]) -> str:
+            if not sampling_params.get("detokenize", True):
+                return ""
+            if self.tokenizer is not None:
+                # The token-only wire response has no engine-rendered text.
+                # Match vLLM's text default without changing public detokenize().
+                return self.tokenizer.decode(
+                    token_ids, skip_special_tokens=sampling_params.get("skip_special_tokens", True)
+                )
+            # The remote /detokenize protocol has no decoding-options fields.
             if detok_sem is None:
                 return (await self.detokenize([token_ids]))[0]
             async with detok_sem:
@@ -702,7 +715,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         sampling_params: Dict[str, Any] = {
             "n": num_samples,
             "logprobs": 0,
-            "output_kind": 2,
+            "output_kind": _VLLM_FINAL_ONLY_OUTPUT_KIND,
             "prompt_logprobs": prompt_logprobs_sp,
         }
 
@@ -1067,6 +1080,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Resume after pause."""
         return await self.resume()
 
+
     async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Put all backends to sleep (offload weights to CPU).
@@ -1082,9 +1096,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
         # Mirror BaseVLLMInferenceEngine.sleep: when the trainer syncs LoRA adapters
         # only, force level=1 so the base model survives via CPU backup. level=2
         # discards weights with no source to restore from on wake_up(["weights"]).
-        if self.uses_lora_weight_sync and level != 1:
+        if (self.uses_lora_weight_sync or self.preserve_weights_on_sleep) and level != 1:
             logger.info(
-                "Forcing sleep level=1 (uses_lora_weight_sync=True); requested level=%d would discard the base model.",
+                "Forcing sleep level=1 to preserve model weights and derived state; requested level=%d.",
                 level,
             )
             level = 1
@@ -1231,35 +1245,21 @@ class RemoteInferenceClient(InferenceEngineInterface):
             kwargs["uri"] = uri
         return await self._call_all_servers("/fetch_weights", kwargs)
 
-    # TODO: Once https://github.com/vllm-project/vllm/pull/39212 lands, switch
-    # these three methods from /collective_rpc to the native vLLM endpoints
-    # (/start_weight_update, /update_weights, /finish_weight_update) and remove
-    # the NewInferenceWorkerWrap worker extension.
+    # TODO: Migrate the main-model session after removing the SkyRL layerwise patches.
 
-    async def start_weight_update(
-        self,
-        is_checkpoint_format: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Start a new chunked weight update via /collective_rpc.
+    async def start_weight_update(self, is_checkpoint_format: bool = True, target: str = "model") -> Dict[str, Any]:
+        """Start a target-model session or a native vLLM draft session."""
+        from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
+            validate_weight_update_target,
+        )
 
-        Calls the NewInferenceWorkerWrap.skyrl_start_weight_update method on all
-        workers. For checkpoint-format weights this initializes layerwise
-        reload. Must be called before any update_weights_ipc calls.
-
-        Args:
-            is_checkpoint_format: True if weights are in checkpoint format
-                (need layerwise processing), False for kernel format.
-
-        Returns:
-            Dict mapping server_url to response.
-        """
+        if validate_weight_update_target(target) == "draft":
+            if not is_checkpoint_format:
+                raise ValueError("Draft weight sync requires checkpoint-format weights")
+            return await self._call_all_servers("/start_draft_weight_update", {})
         return await self._call_all_servers(
             "/collective_rpc",
-            {
-                "method": "skyrl_start_weight_update",
-                "kwargs": {"is_checkpoint_format": is_checkpoint_format},
-            },
+            {"method": "skyrl_start_weight_update", "kwargs": {"is_checkpoint_format": is_checkpoint_format}},
         )
 
     async def update_weights_ipc(
@@ -1317,20 +1317,15 @@ class RemoteInferenceClient(InferenceEngineInterface):
             },
         )
 
-    async def finish_weight_update(self) -> Dict[str, Any]:
-        """
-        Finish the current chunked weight update via /collective_rpc.
-
-        Calls NewInferenceWorkerWrap.skyrl_finish_weight_update on all workers.
-        For checkpoint-format weights, runs layerwise postprocessing.
-
-        Returns:
-            Dict mapping server_url to response.
-        """
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {"method": "skyrl_finish_weight_update"},
+    async def finish_weight_update(self, target: str = "model") -> Dict[str, Any]:
+        """Finalize the session ``start_weight_update`` opened on ``target``."""
+        from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
+            validate_weight_update_target,
         )
+
+        if validate_weight_update_target(target) == "draft":
+            return await self._call_all_servers("/finish_weight_update", {})
+        return await self._call_all_servers("/collective_rpc", {"method": "skyrl_finish_weight_update"})
 
     async def load_lora_adapter(
         self,
@@ -1517,7 +1512,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Sessions owned by other live loops are left untouched; they can only be
         closed from their own loop.
         """
-        self._drop_closed_loop_sessions()
+        await self._drop_closed_loop_sessions()
         session = self._sessions.pop(asyncio.get_running_loop(), None)
         if session is not None and not session.closed:
             try:

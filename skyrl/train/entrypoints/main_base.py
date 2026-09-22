@@ -41,6 +41,20 @@ config_dir = str(Path(__file__).parent.parent / "config")
 __all__ = ["BasePPOExp", "config_dir"]
 
 
+async def _run_with_http_client_cleanup(operation, client):
+    """Release HTTP transports before the enclosing asyncio.run closes its loop."""
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
+
+    try:
+        return await operation()
+    finally:
+        if isinstance(client, RemoteInferenceClient):
+            # This closes only local HTTP sessions, never the inference engine.
+            await client.aclose()
+
+
 class BasePPOExp:
     def __init__(self, cfg: SkyRLTrainConfig):
         """
@@ -50,6 +64,10 @@ class BasePPOExp:
             cfg: The fully resolved SkyRLTrainConfig instance.
         """
         self.cfg = cfg
+        if cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.config import resolve
+
+            resolve(cfg)
         self.tokenizer = get_tokenizer(
             self.cfg.trainer.policy.model.path,
             trust_remote_code=True,
@@ -243,7 +261,7 @@ class BasePPOExp:
 
         if is_colocated:
             # Callers must invoke get_inference_client() from a sync context (no running event loop).
-            asyncio.run(client.sleep())
+            asyncio.run(_run_with_http_client_cleanup(client.sleep, client))
             logger.info("HTTP Inference: Colocated mode - slept inference engines after startup")
 
         return client
@@ -319,7 +337,7 @@ class BasePPOExp:
         try:
             trainer = self._setup_trainer()
             # Start the training loop
-            asyncio.run(trainer.train())
+            asyncio.run(_run_with_http_client_cleanup(trainer.train, trainer.inference_engine_client))
         except Exception as e:
             # OOMs raised inside actor init (e.g. FSDPPolicyWorkerBase.init_model)
             # surface here as RayTaskError. Without this they only land in Ray

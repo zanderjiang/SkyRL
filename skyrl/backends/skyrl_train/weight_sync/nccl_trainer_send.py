@@ -41,6 +41,12 @@ def nccl_trainer_init(init_info: Any) -> "PyNcclCommunicator":
     """
     # Lazy import: vllm is a Linux-only optional dependency (see
     # .claude/docs/weight_sync.md), so this module stays importable without it.
+    import os
+
+    if os.environ.get("ISOEXEC") == "1":
+        from isoexec.integrations.skyrl.vllm import init_weight_transfer
+
+        return init_weight_transfer(init_info)
     from vllm.distributed.weight_transfer.nccl_common import trainer_init
 
     return trainer_init(init_info)

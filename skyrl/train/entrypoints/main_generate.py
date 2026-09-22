@@ -13,6 +13,7 @@ from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInt
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.entrypoints.main_base import (
     BasePPOExp,
+    _run_with_http_client_cleanup,
 )
 from skyrl.train.evaluate import evaluate, evaluate_step_wise
 from skyrl.train.utils.trainer_utils import build_dataloader
@@ -51,7 +52,7 @@ def eval_entrypoint(cfg: SkyRLTrainConfig) -> dict:
     # Build the inference client from a sync context so _get_new_inference_client
     # can run its own asyncio.run() for the colocated-mode sleep step.
     inference_engine_client = exp.get_inference_client()
-    return asyncio.run(exp.run(inference_engine_client))
+    return asyncio.run(_run_with_http_client_cleanup(lambda: exp.run(inference_engine_client), inference_engine_client))
 
 
 def main() -> None:

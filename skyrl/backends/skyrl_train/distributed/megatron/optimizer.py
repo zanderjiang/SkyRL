@@ -79,12 +79,18 @@ def get_megatron_optimizer_param_scheduler(
         raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
 
     lr_warmup_steps = config.num_warmup_steps
-    if getattr(config, "lr_decay_steps", None) is None:
+    lr_decay_steps = getattr(config, "lr_decay_steps", None)
+    if lr_decay_steps is None:
         lr_decay_steps = num_training_steps
     if getattr(config, "lr_warmup_steps_ratio", None) is not None and (
         getattr(config, "lr_warmup_steps", None) is None or getattr(config, "lr_warmup_steps", None) <= 0
     ):
         lr_warmup_steps = int(config.lr_warmup_steps_ratio * lr_decay_steps)
+
+    # A short run may end during warmup. Megatron requires a later decay
+    # horizon even for constant LR; extending it preserves every LR value
+    # while leaving the trainer's stopping limit unchanged.
+    lr_decay_steps = max(lr_decay_steps, lr_warmup_steps + 1)
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,

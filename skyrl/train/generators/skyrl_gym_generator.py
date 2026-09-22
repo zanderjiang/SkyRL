@@ -751,7 +751,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             return_dict=False,
         )
         engine_input = InferenceEngineInput(
-            prompt_token_ids=prompt_token_ids, sampling_params=sampling_params, cache_salt=cache_salt
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            cache_salt=cache_salt,
         )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
         outputs = engine_output["responses"]
@@ -857,7 +859,7 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         if self.batched:
             return await self.generate_batched(
-                prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt
+                prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt,
             )
 
         # Async agent loop to generate trajectories in parallel.

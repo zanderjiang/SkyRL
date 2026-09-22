@@ -479,6 +479,7 @@ class MegatronModelWrapper:
                     packed_seq_params=packed_seq_params,
                     output_processor=fused_lm_head_output_processor,
                     output_processor_context=_op_ctx,
+                    **self._forward_kwargs,
                     **model_replay_kwargs,
                     **vlm_inputs,
                 )
@@ -1153,7 +1154,8 @@ class MegatronModelWrapper:
                         packed_seq_params=packed_seq_params,
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
-                        **model_replay_kwargs,
+                        **self._forward_kwargs,
+                    **model_replay_kwargs,
                         **vlm_inputs,
                     )
                     batch["lm_head_weight"] = _op_ctx.get("lm_head_weight")
@@ -1163,7 +1165,8 @@ class MegatronModelWrapper:
                         new_position_ids,
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
-                        **model_replay_kwargs,
+                        **self._forward_kwargs,
+                    **model_replay_kwargs,
                         **vlm_inputs,
                     )
                 # Replay the MTP block on *detached* trunk hidden states (decoupled draft forward)

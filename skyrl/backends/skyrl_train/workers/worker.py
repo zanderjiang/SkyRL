@@ -97,9 +97,8 @@ class DistributedTorchRayActor:
         os.environ["MASTER_PORT"] = str(self._master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
-        # NOTE: Ray will automatically set the CUDA_VISIBLE_DEVICES
-        # environment variable for each actor, so always set device to 0
-        # os.environ["LOCAL_RANK"] = str(self._local_rank)
+        # With Ray's per-actor mask the assigned device is ordinal 0. With
+        # masking disabled, use the actual GPU allocated to this actor.
         os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0]) if ray_noset_visible_devices() else "0"
         self.sequence_parallel_size: int = sequence_parallel_size
 
@@ -245,13 +244,12 @@ class DistributedTorchRayActor:
         def gpu_numa_node():
             """NUMA node of the GPU this worker owns, or None if it can't be determined.
 
-            Ray masks CUDA_VISIBLE_DEVICES down to this worker's single GPU, so cuda:0 is
-            that GPU and its PCI affinity is the exact answer -- no rank-to-socket heuristic
-            needed (and none works: with one visible device, GPU-count-based sharding sends
-            every rank but 0 to the last node).
+            LOCAL_RANK identifies the assigned GPU with either Ray's per-actor
+            mask or shared device visibility. Its PCI affinity avoids a
+            rank-to-socket heuristic.
             """
             try:
-                props = torch.cuda.get_device_properties(0)
+                props = torch.cuda.get_device_properties(int(os.environ["LOCAL_RANK"]))
                 bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
             except Exception:
                 return None

@@ -507,6 +507,8 @@ class VLLMServerActor(ServerActorProtocol):
             else:
                 prompt = TokensPrompt(prompt_token_ids=token_ids)
             request_id = random_uuid()
+            if (getattr(cli_args, "additional_config", None) or {}).get("isoexec"):
+                request_id = body["request_id"]
 
             final_res = None
             async for res in engine.generate(prompt, sampling_params, request_id=request_id):
@@ -536,6 +538,7 @@ class VLLMServerActor(ServerActorProtocol):
                 routed_experts = pack_routed_experts(resp.routed_experts)
 
             payload = {
+                "id": request_id,
                 "choices": [
                     {
                         "token_ids": token_ids_out,
@@ -612,7 +615,12 @@ async def _build_and_serve_vllm_server(
     sock_addr = (cli_args.host, cli_args.port)
     # One uvicorn per port (no api_server_count fan-out), matching vLLM's own
     # single-server path, so SO_REUSEPORT stays off.
-    sock = create_server_socket(sock_addr, reuse_port=False)
+    if (getattr(cli_args, "additional_config", None) or {}).get("isoexec"):
+        from isoexec.integrations.skyrl.server import create_server_socket as isoexec_socket
+
+        sock = isoexec_socket(sock_addr)
+    else:
+        sock = create_server_socket(sock_addr, reuse_port=False)
     app = build_app(cli_args)
 
     # Initialize the engine (this loads the model - takes time)

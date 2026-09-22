@@ -310,6 +310,41 @@ def _apply_mtp_config(cfg: SkyRLTrainConfig):
         }
 
 
+def _validate_draft_weight_sync_cfg(cfg: SkyRLTrainConfig):
+    """Validate training and transfer support for native MTP draft weights."""
+    from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
+        needs_draft_weight_sync,
+    )
+
+    ie_cfg = cfg.generator.inference_engine
+    if not needs_draft_weight_sync(ie_cfg.speculative_config):
+        return
+    spec = ie_cfg.speculative_config
+    if cfg.trainer.strategy != "megatron":
+        raise ValueError(
+            f"speculative_config={spec} needs the draft model weight-synced, which requires "
+            f"trainer.strategy='megatron' (got {cfg.trainer.strategy!r}): the HF model held by the FSDP "
+            "trainer carries no MTP head tensors"
+        )
+    if ie_cfg.weight_sync_backend in {"sharded_rdt", "delta"}:
+        raise ValueError(
+            f"speculative_config={spec} needs the draft model weight-synced, which is not supported with "
+            f"weight_sync_backend={ie_cfg.weight_sync_backend!r}; use 'nccl'"
+        )
+    if ie_cfg.fp8_weight_sync_mode is not None:
+        raise ValueError(
+            f"speculative_config={spec} needs the draft model weight-synced, which is not supported with "
+            f"fp8_weight_sync_mode={ie_cfg.fp8_weight_sync_mode!r}: the draft session would carry "
+            "marker names and scale tensors the drafter has no loader for"
+        )
+    lora_cfg = cfg.trainer.policy.model.lora
+    if lora_cfg.rank > 0 and not cfg.trainer.policy.megatron_config.lora_config.merge_lora:
+        raise ValueError(
+            f"speculative_config={spec} needs full-weight sync to keep the draft model aligned; "
+            "Megatron LoRA with merge_lora=false syncs adapters only"
+        )
+
+
 def validate_cfg(cfg: SkyRLTrainConfig):
     validate_logprob_comparison(cfg)
     if cfg.trainer.strategy == "fsdp2":
@@ -333,6 +368,7 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # Propagate it to the training side (Megatron MTP heads + decoupled draft loss) and the inference
     # side (vLLM MTP speculative decoding) so both stay consistent.
     _apply_mtp_config(cfg)
+    _validate_draft_weight_sync_cfg(cfg)
 
     if cfg.trainer.enable_isoexec:
         try:
@@ -1116,6 +1152,15 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
             env_vars[var_name] = value
 
+    if cfg.trainer.enable_isoexec:
+        from isoexec.runtimes.environment import resolved_environment
+
+        env_vars.update(resolved_environment(cfg.trainer.policy.model.path))
+        # PIK symmetric-memory rendezvous requires distinct CUDA ordinals across
+        # ranks. Ray's per-actor mask makes every trainer allocation cuda:0.
+        # WorkerBase already selects its Ray-assigned GPU as LOCAL_RANK when
+        # masking is disabled; resource ownership still comes from the PG.
+        env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     return env_vars
 
 
@@ -1192,7 +1237,15 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    runtime_env = {"env_vars": env_vars}
+    if cfg.trainer.enable_isoexec:
+        import sys
+
+        runtime_env["py_executable"] = sys.executable
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto") if cfg.trainer.enable_isoexec else None,
+        runtime_env=runtime_env, log_to_driver=True,
+    )
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")

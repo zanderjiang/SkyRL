@@ -118,6 +118,10 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        if cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.config import resolve
+
+            resolve(cfg)
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -1410,6 +1414,10 @@ class RayPPOTrainer:
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
+        if self.cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.audit import require_comparison
+
+            require_comparison(training_input, action_log_probs)
         if training_input.get("rollout_logprobs", None) is not None and action_log_probs is not None:
             # Abs diff between rollout and forward-pass logprobs, over response tokens. When the
             # forward pass is skipped, the worker's `minibatch_rollout_logprobs_abs_diff_*` is used.
@@ -1417,6 +1425,11 @@ class RayPPOTrainer:
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
                 - action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
+
+            if self.cfg.trainer.enable_isoexec:
+                from isoexec.integrations.skyrl.audit import check_training_batch
+
+                check_training_batch(training_input, action_log_probs, logprobs_diff)
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
             # response dropped by overlong filtering) leaves logprobs_diff empty, and .max()/.min()
