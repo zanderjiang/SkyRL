@@ -1042,6 +1042,9 @@ class SamplingParams(BaseConfig):
 
     max_generate_length: int = 1024
     """Maximum length of the generated response."""
+    min_tokens: int = 1
+    """Minimum generated tokens before EOS or stop tokens are permitted.
+    Set to 0 to sample without the first-token EOS restriction."""
     repetition_penalty: float = 1.0
     """Repetition penalty. ``1.0`` applies no penalty.
     Not forwarded by the typed sampling-params path -- pass it via ``additional_kwargs``."""

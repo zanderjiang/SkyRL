@@ -55,7 +55,9 @@ def build_engine_runtime_env(
 def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig]) -> Dict[str, Any]:
     stop_val = sampling_params.stop
     vllm_sampling_params = {
-        "min_tokens": 1,
+        "min_tokens": (
+            sampling_params.get("min_tokens", 1) if isinstance(sampling_params, DictConfig) else sampling_params.min_tokens
+        ),
         "skip_special_tokens": True,
         "include_stop_str_in_output": True,
         "max_tokens": sampling_params.max_generate_length,
