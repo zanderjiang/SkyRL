@@ -62,7 +62,6 @@ from typing import (
     TypedDict,
     Union,
 )
-from uuid import uuid4
 
 import aiohttp
 import orjson
@@ -540,12 +539,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
             "model": model,
             "token_ids": prompt_token_ids,
         }
-        if self.verify_isoexec_weights:
-            payload["request_id"] = f"{session_id}--{uuid4().hex}"
-            payload["sampling_params"] = {
-                **sampling_params,
-                "extra_args": {**(sampling_params.get("extra_args") or {}), "isoexec_request_id": payload["request_id"]},
-            }
         if mm_features:
             payload["features"] = mm_features
         # `cache_salt` is a top-level request field (forwarded to vLLM's TokensPrompt), not a sampling
@@ -554,16 +547,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
             payload["cache_salt"] = cache_salt
 
         headers = {"Content-Type": "application/json"}
-        if self.verify_isoexec_weights:
-            headers["X-Request-Id"] = payload["request_id"]
         if session_id:
             headers["X-Session-ID"] = str(session_id)
 
         response = await self._post(url, json=payload, headers=headers)
-        if self.verify_isoexec_weights:
-            from isoexec.integrations.skyrl.audit import record_request
-
-            record_request(self, payload, response, session_id)
 
         choice = response["choices"][0]
         token_ids = choice["token_ids"]
@@ -1079,26 +1066,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Resume after pause."""
         return await self.resume()
 
-    async def isoexec_refusal_begin_step(self, run_name: str, step: int, request_map: dict) -> dict[str, Any]:
-        from isoexec.integrations.skyrl.audit import begin_requests
-
-        begin_requests(self, run_name, step)
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {"method": "isoexec_refusal_begin_step", "kwargs": {"run_name": run_name, "step": step, "request_map": request_map}},
-        )
-
-    async def isoexec_refusal_end_step(self) -> list[dict[str, Any]]:
-        from isoexec.integrations.skyrl.audit import finish_requests
-
-        responses = await self._call_all_servers("/collective_rpc", {"method": "isoexec_refusal_end_step"})
-        receipts = [receipt for response in responses.values() for receipt in response["body"]["results"]]
-        receipts[0]["request_outputs"] = finish_requests(
-            self,
-            request_aliases=[trace["request_aliases"] for receipt in receipts for trace in receipt["trace"]],
-            mismatch=any(r["verdict"] != "clean" for r in receipts),
-        )
-        return receipts
 
     async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """

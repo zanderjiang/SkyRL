@@ -360,21 +360,10 @@ class RayPPOTrainer:
                         )
 
                         # 1.1. generation phase
-                        if self.cfg.trainer.enable_isoexec:
-                            await self.inference_engine_client.isoexec_refusal_begin_step(
-                                self.cfg.trainer.run_name,
-                                self.global_step,
-                                {
-                                    f"{tid.instance_id}_{tid.repetition_id}": {"uid": uid, "batch_idx": i}
-                                    for i, (tid, uid) in enumerate(zip(generator_input["trajectory_ids"], uids))
-                                },
-                            )
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.resume()
                         with Timer("generate", self.all_timings):
                             generator_output: GeneratorOutput = await self.generate(generator_input)
-                        if self.cfg.trainer.enable_isoexec and not self.cfg.generator.step_wise_trajectories:
-                            generator_output["trajectory_ids"] = generator_input["trajectory_ids"]
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.pause()
 
@@ -390,13 +379,6 @@ class RayPPOTrainer:
                                 # update progress bar for current batch (but not global step)
                                 pbar.update(1)
                                 continue
-
-                        if self.cfg.trainer.enable_isoexec:
-                            self._isoexec_engine_artifacts = await self.inference_engine_client.isoexec_refusal_end_step()
-                            logger.info(
-                                "IsoExec step {} weight verdicts: {}", self.global_step,
-                                [receipt["verdict"] for receipt in self._isoexec_engine_artifacts],
-                            )
 
                         if self.colocate_all:
                             # if we are not continuing sampling, we sleep the inference engine
@@ -965,10 +947,6 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
-        if self.cfg.trainer.enable_isoexec:
-            training_input.metadata["request_sessions"] = [
-                f"{tid.instance_id}_{tid.repetition_id}" for tid in generator_output["trajectory_ids"]
-            ]
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1428,8 +1406,7 @@ class RayPPOTrainer:
             if self.cfg.trainer.enable_isoexec:
                 from isoexec.integrations.skyrl.audit import check_training_batch
 
-                check_training_batch(self, training_input, action_log_probs, logprobs_diff,
-                                     save_trainer_weights=self._isoexec_save_refusal_weights)
+                check_training_batch(training_input, action_log_probs, logprobs_diff)
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
             # response dropped by overlong filtering) leaves logprobs_diff empty, and .max()/.min()
@@ -1448,10 +1425,6 @@ class RayPPOTrainer:
                     }
                 )
         return training_input
-
-    def _isoexec_save_refusal_weights(self, path):
-        self.dispatch.save_hf_model("policy", str(path), self.tokenizer)
-        return {"format": "huggingface", "policy_step": self.global_step, "optimizer_updated": False}
 
     def apply_reward_kl_penalty(
         self,

@@ -1016,11 +1016,6 @@ class MegatronWorker:
 
         return padded
 
-    def isoexec_refusal_receipt(self):
-        from isoexec.integrations.skyrl.audit import trainer_receipt
-
-        return trainer_receipt(self)
-
     def save_hf_model(self, export_dir: str, tokenizer):
         if self.cfg.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import save_hf_model
@@ -1257,11 +1252,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         ``metrics``; it has no effect on the inference path.
         """
         if loss_fn is None:
-            if self.cfg.enable_isoexec:
-                from isoexec.integrations.skyrl.scoring import _find_isoexec_stage
-                from isoexec.debug.refusal.weights import check_trainer_scoring
-
-                check_trainer_scoring(_find_isoexec_stage(self.actor_module))
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
             # `_forward_logprobs`, which also reorders back to the original sample order.
@@ -1579,13 +1569,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
-        if self.cfg.enable_isoexec:
-            from isoexec.integrations.skyrl.megatron import check_optimizer_update
-
-            check_optimizer_update(self, "before-finalize")
         self.model.run_pending_grad_sync()
-        if self.cfg.enable_isoexec:
-            check_optimizer_update(self, "after-finalize")
 
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
         if self.cfg.enable_isoexec:
