@@ -649,7 +649,7 @@ class MegatronWorker:
         provider.context_parallel_size = megatron_config.context_parallel_size
         provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
         provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
-        provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
+        provider.sequence_parallel = megatron_config.sequence_parallel
         provider.attention_backend = "flash" if flash_attn else "fused"
         provider.variable_seq_lengths = True
         provider.masked_softmax_fusion = True

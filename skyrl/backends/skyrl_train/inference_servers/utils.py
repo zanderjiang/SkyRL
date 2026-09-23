@@ -209,6 +209,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         seed=cfg.trainer.seed,
         gpu_memory_utilization=ie_cfg.gpu_memory_utilization,
         enable_prefix_caching=ie_cfg.enable_prefix_caching,
+        enable_chunked_prefill=ie_cfg.enable_chunked_prefill,
         enforce_eager=ie_cfg.enforce_eager,
         max_num_batched_tokens=ie_cfg.max_num_batched_tokens,
         enable_expert_parallel=ie_cfg.expert_parallel_size > 1,

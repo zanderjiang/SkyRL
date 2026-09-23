@@ -611,6 +611,11 @@ class MegatronConfig(BaseConfig):
     window but delays the background write (per-tensor shared-memory handoff cost).
     See ``_stage_async_request_to_host``."""
 
+    @property
+    def sequence_parallel(self) -> bool:
+        """Resolve the native TP-dependent default and explicit transformer override."""
+        return self.transformer_config_kwargs.get("sequence_parallel", self.tensor_model_parallel_size > 1)
+
     def __post_init__(self):
         # Backfill defaults for any keys the user didn't override so an override dict
         # doesn't have to repeat every default just to set one value.

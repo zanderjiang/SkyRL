@@ -294,3 +294,15 @@ class TestGetPDCLIArgs:
         args = Namespace()
         with pytest.raises(ValueError, match="kv_transfer_config must be set when enable_pd=True"):
             get_pd_cli_args(args, role="decode")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_chunked_prefill_setting_reaches_engine(monkeypatch, enabled):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.enable_chunked_prefill = enabled
+    assert build_vllm_cli_args(cfg).enable_chunked_prefill is enabled
+    cfg.generator.inference_engine.engine_init_kwargs["enable_chunked_prefill"] = not enabled
+    assert build_vllm_cli_args(cfg).enable_chunked_prefill is (not enabled)
