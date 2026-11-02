@@ -9,7 +9,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import ray
 import torch
@@ -438,12 +438,24 @@ def validate_cfg(cfg: SkyRLTrainConfig):
 
     # Validate generation config separately
     validate_generator_cfg(cfg)
+    validate_logprob_comparison(cfg)
 
     # Multi-Token Prediction (MTP): the high-level `trainer.mtp` knob is the single source of truth.
     # Propagate it to the training side (Megatron MTP heads + decoupled draft loss) and the inference
     # side (vLLM MTP speculative decoding) so both stay consistent.
     _apply_mtp_config(cfg)
     _validate_draft_weight_sync_cfg(cfg)
+
+    if cfg.enable_isoexec:
+        try:
+            from isoexec.integrations.skyrl.config import resolve as resolve_isoexec
+        except ModuleNotFoundError as exc:
+            if exc.name == "isoexec":
+                raise RuntimeError(
+                    "enable_isoexec=true requires the local IsoExec package in the runtime environment"
+                ) from exc
+            raise
+        resolve_isoexec(cfg)
 
     from skyrl.backends.skyrl_train.utils.ppo_utils import (
         AdvantageEstimatorRegistry,
@@ -641,6 +653,21 @@ def validate_cfg(cfg: SkyRLTrainConfig):
                 f"ref_num_gpus_per_node ({cfg.trainer.placement.ref_num_gpus_per_node}) must be the same "
                 f"when colocate policy and ref model."
             )
+
+
+def validate_logprob_comparison(cfg: SkyRLTrainConfig) -> None:
+    trainer = cfg.trainer
+    engine = cfg.generator.inference_engine
+    if engine.logprob_output != trainer.rollout_logprob_comparison:
+        raise ValueError("trainer.rollout_logprob_comparison and generator.inference_engine.logprob_output must match")
+    if trainer.rollout_logprob_comparison == "full":
+        if not cfg.enable_isoexec:
+            raise ValueError("full logprob comparison requires enable_isoexec=true")
+        from isoexec.integrations.skyrl.full_distribution_config import (
+            validate_full_distribution_config,
+        )
+
+        validate_full_distribution_config(cfg)
 
 
 def validate_generator_cfg(cfg: SkyRLTrainConfig):
@@ -1190,6 +1217,15 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         logger.info(f"Exporting SKYRL_* overrides to ray runtime env: {sorted(forwarded)}")
     env_vars.update(forwarded)
 
+    if cfg.enable_isoexec:
+        # IsoExec reads its ISOEXEC* switches inside the trainer actors (the TRAIN channel of its
+        # flag registry). Workers are spawned by the raylet, so a value exported in the launching
+        # shell after `ray start` only reaches them through the job-level runtime env.
+        isoexec_forwarded = {k: v for k, v in os.environ.items() if k.startswith("ISOEXEC") and k not in env_vars}
+        if isoexec_forwarded:
+            logger.info(f"Exporting ISOEXEC* overrides to ray runtime env: {sorted(isoexec_forwarded)}")
+        env_vars.update(isoexec_forwarded)
+
     # Forward one block-scale contract to all Ray actors. Hopper defaults to FP32
     # scales; Blackwell (SM100+) defaults to power-of-two scales, the only mode TE
     # supports for blockwise quantization there (it emulates Float8BlockScaling on
@@ -1272,6 +1308,17 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
             env_vars[var_name] = value
 
+    if cfg.enable_isoexec:
+        from isoexec.runtimes.environment import resolved_environment
+
+        model_path = cfg.trainer.policy.model.path
+        if not model_path:
+            raise ValueError("enable_isoexec=true requires trainer.policy.model.path")
+        env_vars.update(resolved_environment(model_path))
+        # IsoExec's communicator plan identifies physical GPUs across colocated
+        # trainer/engine actors. Preserve the full device namespace and let each
+        # worker select the ordinal Ray assigned through ``ray.get_gpu_ids()``.
+        env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     return env_vars
 
 
@@ -1351,7 +1398,14 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    runtime_env: dict[str, Any] = {"env_vars": env_vars}
+    if cfg.enable_isoexec:
+        runtime_env["py_executable"] = sys.executable
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto") if cfg.enable_isoexec else None,
+        runtime_env=runtime_env,
+        log_to_driver=True,
+    )
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")

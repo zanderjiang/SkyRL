@@ -57,6 +57,7 @@ class ServerGroup:
         mooncake_bootstrap_base_port: int = 50052,
         server_actor_cls: Optional[Type[ServerActorProtocol]] = None,
         use_expandable_segments: bool = False,
+        extra_env_vars: Optional[dict[str, str]] = None,
         **server_actor_kwargs: Any,
     ):
         """
@@ -81,6 +82,8 @@ class ServerGroup:
                 server_idx to start searching for a free port.
             server_actor_cls: Server actor class implementing
                 ServerActorProtocol. Defaults to VLLMServerActor.
+            extra_env_vars: Environment variables that must exist before the
+                server actor imports its inference backend.
             **server_actor_kwargs: Additional keyword arguments to pass to the server actor class.
         """
         from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import (
@@ -100,6 +103,7 @@ class ServerGroup:
         self._internal_pg: Optional[PlacementGroup] = None
         self._server_actor_kwargs = server_actor_kwargs
         self._use_expandable_segments = use_expandable_segments
+        self._extra_env_vars = extra_env_vars
         self._external_pg = placement_group
 
         # Extract the raw PG, reordered indices, and GPU IDs from ResolvedPlacementGroup.
@@ -145,10 +149,7 @@ class ServerGroup:
 
     def _create_actor_class(self, pg: PlacementGroup, start_bundle_idx: int) -> Any:
         """Create actor class with scheduling constraints for a specific bundle."""
-        # Engine-actor runtime_env (env vars applied before CUDA init and inherited by the
-        # child vLLM workers). Currently just the expandable_segments allocator, which is
-        # safe with sleep mode on vLLM >= 0.20.1.
-        runtime_env = build_engine_runtime_env(use_expandable_segments=self._use_expandable_segments)
+        runtime_env = self._engine_runtime_env()
         return ray.remote(self._server_actor_cls).options(
             num_gpus=0,  # GPU allocation managed by placement group
             num_cpus=COLOCATED_ACTOR_CPU_FRACTION,
@@ -158,6 +159,13 @@ class ServerGroup:
                 placement_group_bundle_index=start_bundle_idx,
             ),
             runtime_env=runtime_env,
+        )
+
+    def _engine_runtime_env(self) -> Optional[dict[str, Any]]:
+        """Build env vars before the actor imports CUDA or its inference backend."""
+        return build_engine_runtime_env(
+            use_expandable_segments=self._use_expandable_segments,
+            extra_env_vars=self._extra_env_vars,
         )
 
     def _get_bundle_indices_for_server(self, server_idx: int) -> List[int]:

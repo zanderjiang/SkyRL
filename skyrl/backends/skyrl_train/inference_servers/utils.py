@@ -129,6 +129,23 @@ def _apply_serialized_fp8_weight_sync_defaults(
     engine_kwargs["hf_overrides"] = hf_overrides
 
 
+def _apply_full_logprob_engine_defaults(engine_kwargs: Dict[str, Any]) -> None:
+    """Request complete raw rows; IsoExec validates and compares their float32 bytes."""
+    for key, value in {"max_logprobs": -1, "logprobs_mode": "raw_logprobs"}.items():
+        if key in engine_kwargs and engine_kwargs[key] != value:
+            raise ValueError(f"engine_init_kwargs.{key} must be {value!r} for full logprobs")
+        engine_kwargs[key] = value
+
+
+def _apply_isoexec_engine_args(cfg: SkyRLTrainConfig, args: Namespace) -> None:
+    """Let the opt-in integration update SkyRL's already-resolved vLLM arguments."""
+    if not cfg.enable_isoexec:
+        return
+    from isoexec.integrations.skyrl.config import engine_args
+
+    engine_args(cfg, args)
+
+
 def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str) -> None:
     """Raises if *engine_kwargs* sets ``logprobs_mode`` to anything but ``VLLM_LOGPROBS_MODE``."""
     logprobs_mode = engine_kwargs.get("logprobs_mode", VLLM_LOGPROBS_MODE)
@@ -347,7 +364,12 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
-    _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    if cfg.enable_isoexec:
+        args.logprobs_mode = "raw_logprobs"
+    else:
+        _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    if ie_cfg.logprob_output == "full":
+        _apply_full_logprob_engine_defaults(engine_kwargs)
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -365,6 +387,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             }
             logger.info(f"vLLM MoE expert LoRA slot rank: {expert_rank} (max_lora_rank={args.max_lora_rank})")
 
+    _apply_isoexec_engine_args(cfg, args)
     return args
 
 

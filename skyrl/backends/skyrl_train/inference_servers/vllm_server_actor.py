@@ -44,6 +44,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
     PackedField,
     build_logprobs_content,
+    pack_full_logprobs,
     pack_routed_experts,
     pack_sample_support,
     pack_sample_support_logprobs,
@@ -621,6 +622,26 @@ class VLLMServerActor(ServerActorProtocol):
                     status_code=400,
                     detail="return_sample_support_logprobs requires return_sample_support",
                 )
+            return_full_logprobs = body.get("return_full_logprobs", False)
+            if not isinstance(return_full_logprobs, bool):
+                raise HTTPException(status_code=400, detail="return_full_logprobs must be a boolean")
+            if return_full_logprobs:
+                if capture_sample_support:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="full logprobs and sample-support capture cannot be requested together",
+                    )
+                if lora_request is not None:
+                    raise HTTPException(status_code=400, detail="full logprobs do not support LoRA")
+                if (
+                    sampling_params_dict.get("logprobs") != -1
+                    or sampling_params_dict.get("n", 1) != 1
+                    or engine.model_config.logprobs_mode != "raw_logprobs"
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="full logprobs require logprobs=-1, n=1, and raw_logprobs mode",
+                    )
             if capture_sample_support:
                 # Sample support requires a bounded, non-degenerate top-k set.
                 top_k = sampling_params_dict.get("top_k")
@@ -661,6 +682,8 @@ class VLLMServerActor(ServerActorProtocol):
 
             if final_res is None:
                 raise HTTPException(status_code=500, detail="vLLM returned no output")
+            if return_full_logprobs and len(final_res.outputs) != 1:
+                raise HTTPException(status_code=500, detail="full logprobs require exactly one output")
             resp = final_res.outputs[0]
 
             token_ids_out = list(resp.token_ids)
@@ -704,6 +727,12 @@ class VLLMServerActor(ServerActorProtocol):
                     }
                 ]
             }
+            if return_full_logprobs:
+                payload["choices"][0][PackedField.FULL_LOGPROBS.value] = pack_full_logprobs(
+                    token_ids_out,
+                    resp.logprobs,
+                    engine.model_config.get_vocab_size(),
+                )
             return Response(content=orjson.dumps(payload), media_type="application/json")
 
     async def shutdown(self) -> None:

@@ -15,9 +15,11 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedArrayKey,
     PackedField,
     build_logprobs_content,
+    decode_packed_full_logprobs,
     decode_packed_routed_experts,
     decode_packed_sample_support,
     load_packed_body,
+    pack_full_logprobs,
     pack_ndarray,
     pack_routed_experts,
     pack_sample_support,
@@ -78,6 +80,23 @@ def test_clamped_payload_round_trips_through_orjson():
 
 def test_empty_logprobs_input():
     assert build_logprobs_content([], []) == ([], 0)
+
+
+def test_full_logprob_rows_round_trip_without_changing_float32_bits():
+    token_ids = [1, 2]
+    values = np.array(
+        [[-3.0, np.nextafter(np.float32(-0.25), np.float32(0.0)), -2.0], [-4.0, -5.0, -0.75]],
+        dtype=np.float32,
+    )
+    rows = [{token_id: _Logprob(float(value)) for token_id, value in enumerate(row)} for row in values]
+
+    packed = pack_full_logprobs(token_ids, rows, vocab_size=3)
+    raw = orjson.dumps(_body(full_logprobs=packed))
+    envelope = load_packed_body(raw)["choices"][0][PackedField.FULL_LOGPROBS]
+    decoded = decode_packed_full_logprobs(envelope)
+
+    assert isinstance(envelope[PackedArrayKey.DATA], memoryview)
+    assert decoded.tobytes() == values.tobytes()
 
 
 def test_null_logprob_entry_is_clamped_not_raised():

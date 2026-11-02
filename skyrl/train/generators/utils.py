@@ -320,7 +320,12 @@ def concatenate_generator_outputs(
     """
     assert len(generator_outputs) > 0
     # Per-token side channels must be populated consistently across batches.
-    for all_or_nothing_field in ("rollout_logprobs", "rollout_expert_indices", "rollout_sample_support"):
+    for all_or_nothing_field in (
+        "rollout_logprobs",
+        "rollout_full_logprobs",
+        "rollout_expert_indices",
+        "rollout_sample_support",
+    ):
         present = [output.get(all_or_nothing_field) is not None for output in generator_outputs]
         if any(present) and not all(present):
             raise ValueError(
@@ -335,6 +340,7 @@ def concatenate_generator_outputs(
         "loss_masks": _flatten_field(generator_outputs, "loss_masks"),
         "stop_reasons": _concat_optional_field(generator_outputs, "stop_reasons"),
         "rollout_logprobs": _concat_optional_field(generator_outputs, "rollout_logprobs"),
+        "rollout_full_logprobs": _concat_optional_field(generator_outputs, "rollout_full_logprobs"),
         "rollout_expert_indices": _concat_optional_field(generator_outputs, "rollout_expert_indices"),
         "rollout_sample_support": _concat_optional_field(generator_outputs, "rollout_sample_support"),
         "trajectory_generation_times": _concat_optional_field(generator_outputs, "trajectory_generation_times"),

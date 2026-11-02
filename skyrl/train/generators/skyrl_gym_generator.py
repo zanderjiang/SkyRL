@@ -894,6 +894,26 @@ class SkyRLGymGenerator(GeneratorInterface):
         responses = engine_output["response_ids"]
         stop_reasons = engine_output["stop_reasons"]
         logprobs = engine_output.get("response_logprobs", None)
+        full_logprobs = engine_output.get("response_full_logprobs")
+        if self.generator_cfg.inference_engine.logprob_output == "full":
+            requested_logprobs = (
+                self.generator_cfg.sampling_params.logprobs
+                if sampling_params is None
+                else sampling_params.get("logprobs")
+            )
+            if requested_logprobs is not None and full_logprobs is None:
+                raise ValueError("Full logprob output is missing from the inference engine response")
+        if full_logprobs is not None and (
+            len(full_logprobs) != len(responses)
+            or any(
+                not isinstance(rows, np.ndarray)
+                or rows.dtype != np.float32
+                or rows.ndim != 2
+                or rows.shape[0] != len(response)
+                for rows, response in zip(full_logprobs, responses, strict=True)
+            )
+        ):
+            raise ValueError("Full logprob output must contain one float32 vocabulary row per response token")
         raw_rollout_expert_indices = (
             engine_output.get("rollout_expert_indices", None) if capture_routed_experts else None
         )
@@ -904,6 +924,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         loss_masks = []
         env_metrics = []
         truncated_logprobs: Optional[List[List[float]]] = [] if logprobs is not None else None
+        truncated_full_logprobs: Optional[List[np.ndarray]] = [] if full_logprobs is not None else None
         truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
         truncated_sample_support: Optional[List[CompactSampleSupport]] = (
             [] if raw_rollout_sample_support is not None else None
@@ -922,6 +943,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             if logprobs is not None:
                 sample_logprobs = logprobs[i][: len(response)]
                 truncated_logprobs.append(sample_logprobs)
+            if full_logprobs is not None:
+                truncated_full_logprobs.append(full_logprobs[i][: len(response)])
             if raw_rollout_expert_indices is not None:
                 sample_indices = raw_rollout_expert_indices[i]
                 prompt_len = len(prompt_token_ids[i])
@@ -948,6 +971,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "stop_reasons": stop_reasons,
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": truncated_logprobs,
+            "rollout_full_logprobs": truncated_full_logprobs,
             "rollout_expert_indices": truncated_indices,
             "rollout_sample_support": truncated_sample_support,
         }

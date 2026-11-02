@@ -147,6 +147,27 @@ def test_cli_overrides_empty_args():
     cfg = SkyRLTrainConfig.from_cli_overrides([])
     assert cfg.trainer.policy.model.path == "Qwen/Qwen2.5-1.5B-Instruct"
     assert cfg.trainer.seed == 42
+    assert cfg.enable_isoexec is False
+    assert cfg.trainer.rollout_logprob_comparison == "action"
+    assert cfg.generator.inference_engine.logprob_output == "action"
+    assert cfg.isoexec_model is None
+
+
+def test_logprob_comparison_modes_must_match():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.logprob_output = "full"
+
+    with pytest.raises(ValueError, match="must match"):
+        train_utils.validate_logprob_comparison(cfg)
+
+
+def test_full_logprob_comparison_requires_isoexec():
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.rollout_logprob_comparison = "full"
+    cfg.generator.inference_engine.logprob_output = "full"
+
+    with pytest.raises(ValueError, match="enable_isoexec=true"):
+        train_utils.validate_logprob_comparison(cfg)
 
 
 def test_cli_overrides_fp8_param_gather():

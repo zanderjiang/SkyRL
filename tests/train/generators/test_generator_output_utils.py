@@ -32,6 +32,7 @@ def test_generator_output_concatenation():
         "stop_reasons",
         "rollout_metrics",
         "rollout_logprobs",
+        "rollout_full_logprobs",
         "rollout_expert_indices",
         "rollout_sample_support",
         # optional but present in the signature

@@ -1193,6 +1193,8 @@ class SamplingParams(BaseConfig):
 
     max_generate_length: int = 1024
     """Maximum length of the generated response."""
+    min_tokens: int = 1
+    """Minimum generated tokens before EOS or stop tokens are permitted. Set to 0 for unrestricted sampling."""
     repetition_penalty: float = 1.0
     """Repetition penalty. ``1.0`` applies no penalty.
     Not forwarded by the typed sampling-params path -- pass it via ``additional_kwargs``."""
@@ -1298,6 +1300,10 @@ SUPPORTED_SPECULATIVE_DECODING_METHODS = ("mtp",)
 class InferenceEngineConfig(BaseConfig):
     """Configuration for inference engine instantiation and management."""
 
+    logprob_output: Literal["action", "full"] = "action"
+    """Logprob values returned for training rollouts.
+    ``"action"`` returns only the sampled-token value. ``"full"`` additionally returns one
+    float32 vocabulary row per response token for IsoExec's pre-update comparison."""
     model_dtype: str = "bfloat16"
     """Should match the dtype used by the inference engine.
     Also used during full-weight sync, where policy weights are cast to this dtype before being sent
@@ -1414,8 +1420,8 @@ class InferenceEngineConfig(BaseConfig):
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine.
     Names must match the engine's args. Applied last, so they silently override config-derived
-    engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``, which is
-    always ``"processed_logprobs"``; any other value is rejected.
+    engine args (e.g. ``tensor_parallel_size``). ``logprobs_mode`` must be
+    ``"processed_logprobs"`` normally, or ``"raw_logprobs"`` with the IsoExec opt-in.
 
     For HuggingFace config overrides such as RoPE scaling, use
     ``engine_init_kwargs.hf_overrides.rope_parameters`` and set the matching trainer-side override
@@ -1598,6 +1604,9 @@ class TrainerConfig(BaseConfig):
     strategy: str = "fsdp"
     """Training backend: either ``"fsdp"`` or ``"megatron"``.
     ``"fsdp"`` uses PyTorch's composable ``fully_shard`` API (formerly known as FSDP2)."""
+    rollout_logprob_comparison: Literal["action", "full"] = "action"
+    """Rollout-versus-trainer comparison performed before optimizer mutation.
+    ``"full"`` requires matching ``generator.inference_engine.logprob_output`` and IsoExec."""
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     ref: RefConfig = field(default_factory=RefConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
@@ -2001,6 +2010,13 @@ class SkyRLTrainConfig(BaseConfig):
     ``from_cli_overrides``): ``trainer.policy.model.path=...`` sets
     ``SkyRLTrainConfig.trainer.policy.model.path``.
     """
+
+    enable_isoexec: bool = False
+    """Build trainer and rollout models through the installed IsoExec package.
+    IsoExec remains opt-in and must be installed in every driver, trainer, and inference-worker environment."""
+    isoexec_model: Optional[Dict[str, Any]] = None
+    """Optional JSON V2 source/configuration and separate trainer/inference placement policy.
+    Native Megatron and inference-engine parallelism fields remain authoritative."""
 
     data: DataConfig = field(default_factory=DataConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)

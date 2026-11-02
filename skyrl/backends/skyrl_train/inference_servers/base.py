@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, TypedDict
 
+import numpy as np
+
 from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
 from skyrl.backends.skyrl_train.utils.sample_support import CompactSampleSupport
 
@@ -49,6 +51,7 @@ class InferenceEngineOutput(TypedDict):
     response_ids: List[List[int]]
     stop_reasons: List[str]
     response_logprobs: Optional[List[List[float]]]
+    response_full_logprobs: Optional[List[np.ndarray]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
     # One CSR support block, with a row per generated token, per prompt.

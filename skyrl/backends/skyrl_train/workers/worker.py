@@ -305,9 +305,18 @@ class DistributedTorchRayActor:
 
 
 class Worker(DistributedTorchRayActor):
-    def __init__(self, cfg: TrainerConfig, *args, **kwargs):
+    def __init__(
+        self,
+        cfg: TrainerConfig,
+        *args,
+        enable_isoexec: bool = False,
+        isoexec_model: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
+        self.enable_isoexec = enable_isoexec
+        self.isoexec_model = isoexec_model
         # Populated by init_model when torch profiling is enabled.
         self.profiler = None
 
@@ -779,6 +788,8 @@ class PPORayActorGroup:
         colocate_all: bool = False,
         sequence_parallel_size: int = 1,
         record_memory: bool = False,
+        enable_isoexec: bool = False,
+        isoexec_model: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
@@ -797,6 +808,8 @@ class PPORayActorGroup:
         self.colocate_all = colocate_all
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
+        self.enable_isoexec = enable_isoexec
+        self.isoexec_model = isoexec_model
         self._last_dp_size: Optional[int] = None
         self._initiate_actors(pg, num_gpus_per_actor)
 
@@ -868,6 +881,8 @@ class PPORayActorGroup:
 
         master_actor = self.ray_actor_type.options(**actor_options).remote(
             cfg=self.cfg,
+            enable_isoexec=self.enable_isoexec,
+            isoexec_model=self.isoexec_model,
             world_size=world_size,
             rank=0,
             local_rank=0,
@@ -894,6 +909,8 @@ class PPORayActorGroup:
 
                 worker_actor = self.ray_actor_type.options(**actor_options).remote(
                     cfg=self.cfg,
+                    enable_isoexec=self.enable_isoexec,
+                    isoexec_model=self.isoexec_model,
                     world_size=world_size,
                     rank=rank,
                     local_rank=local_rank,

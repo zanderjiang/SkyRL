@@ -596,6 +596,7 @@ EXPECTED_TRAINING_INPUT_FIELDS = {
     "kl",
     "rewards",
     "rollout_logprobs",
+    "rollout_full_logprobs",
     "rollout_expert_indices",
     "router_padding_mask",
     SAMPLE_SUPPORT_FIELD,
@@ -623,6 +624,7 @@ def _make_full_training_batch(batch_size: int = 4, seq_len: int = 5) -> Training
         "kl": torch.randn(batch_size, seq_len),
         "rewards": torch.randn(batch_size, seq_len),
         "rollout_logprobs": torch.randn(batch_size, seq_len),
+        "rollout_full_logprobs": torch.randn(batch_size, seq_len, 7),
         # The fixture is fully attended, so each route segment has seq_len rows.
         "rollout_expert_indices": PackedTensor(
             torch.randint(0, 8, (batch_size * seq_len, 2, 3), dtype=torch.long),
@@ -833,6 +835,7 @@ _ZERO_COPY_BATCH_SIZE = len(_ZERO_COPY_SEGMENT_LENGTHS)
 
 # One test payload per opted-in field.
 _ZERO_COPY_PAYLOADS: dict[str, Callable[[], BatchField]] = {
+    "rollout_full_logprobs": lambda: torch.randn(_ZERO_COPY_BATCH_SIZE, 16, 32),
     ROUTE_KEY: lambda: PackedTensor(
         torch.randint(0, 64, (sum(_ZERO_COPY_SEGMENT_LENGTHS), 2, 3), dtype=torch.int16),
         cu_seqlens_from_lengths(_ZERO_COPY_SEGMENT_LENGTHS),
@@ -893,7 +896,10 @@ def test_zero_copy_field_tolerates_read_only_plasma_buffer(key, oob_round_trip):
     for restored, view in zip(_zero_copy_buffers(unpickled[key]), views):
         restored = restored.numpy()
         assert np.shares_memory(restored, np.frombuffer(view, dtype=restored.dtype)), "read-only buffer was copied"
-    assert unpickled[key] == field
+    if isinstance(field, torch.Tensor):
+        assert torch.equal(unpickled[key], field)
+    else:
+        assert unpickled[key] == field
 
     got = unpickled["advantages"]
     assert got.numpy().flags.writeable

@@ -60,6 +60,7 @@ def create_inference_servers(
     placement_group=None,
     *,
     start_port: int = VLLM_START_PORT,
+    extra_env_vars: Optional[dict[str, str]] = None,
 ) -> InferenceServerSetup:
     """Build server groups and router from config.
 
@@ -137,6 +138,7 @@ def create_inference_servers(
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_prefill)
         ]
@@ -161,6 +163,7 @@ def create_inference_servers(
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_decode)
         ]
@@ -238,6 +241,7 @@ def create_inference_servers(
                 placement_group_bundle_offset=i * gpus_per_server * ie_cfg.data_parallel_size,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(ie_cfg.num_engines)
         ]
@@ -284,11 +288,18 @@ def build_new_inference_client(
         Tuple of (client, server_setup); see :func:`build_new_inference_client_impl`.
     """
     ie_cfg = cfg.generator.inference_engine
+    make_engine_env = None
+    if cfg.enable_isoexec:
+        from isoexec.integrations.skyrl.config import engine_runtime_env
+
+        make_engine_env = engine_runtime_env
     return build_new_inference_client_impl(
         ie_cfg,
         model_path=cfg.trainer.policy.model.path,
         log_path=cfg.trainer.log_path,
         make_cli_args=lambda: build_vllm_cli_args(cfg),
+        make_engine_env=make_engine_env,
+        logprob_output=ie_cfg.logprob_output,
         placement_group=placement_group,
         tokenizer=tokenizer,
         enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
@@ -304,6 +315,7 @@ def build_new_inference_client_impl(
     model_path: str,
     log_path: str,
     make_cli_args: Callable[[], Namespace],
+    make_engine_env: Optional[Callable[[Namespace], dict[str, str]]] = None,
     placement_group: Optional[ResolvedPlacementGroup] = None,
     start_port: int = VLLM_START_PORT,
     **client_kwargs: Any,
@@ -374,12 +386,15 @@ def build_new_inference_client_impl(
                 "generator.inference_engine.run_engines_locally=false requires "
                 "external_proxy_url or external_server_urls."
             )
+        cli_args = make_cli_args()
+        extra_env_vars = make_engine_env(cli_args) if make_engine_env is not None else None
         server_setup = create_inference_servers(
             ie_cfg,
-            make_cli_args(),
+            cli_args,
             log_path=log_path,
             placement_group=placement_group,
             start_port=start_port,
+            extra_env_vars=extra_env_vars,
         )
 
     client = RemoteInferenceClient(

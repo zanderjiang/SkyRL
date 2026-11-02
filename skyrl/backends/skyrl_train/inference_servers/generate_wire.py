@@ -47,6 +47,7 @@ class PackedArrayKey(StrEnum):
 class PackedField(StrEnum):
     """Response-body fields whose value is a packed-array envelope."""
 
+    FULL_LOGPROBS = "full_logprobs"
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
     # float32 sampler logprob of each support member, in the support's member order.
@@ -106,6 +107,22 @@ def build_logprobs_content(
             logprob = CLAMPED_LOGPROB
         content.append({"logprob": logprob})
     return content, num_clamped
+
+
+def pack_full_logprobs(token_ids: list[int], resp_logprobs: Any, vocab_size: int) -> dict[str, Any]:
+    """Validate and encode complete rows through IsoExec's bit-preserving codec."""
+    from isoexec.integrations.full_distribution import pack_full_logprobs as pack
+
+    return pack(token_ids, resp_logprobs, vocab_size)
+
+
+def decode_packed_full_logprobs(payload: dict[str, Any]) -> np.ndarray:
+    """Decode complete rows through the same IsoExec codec used by the server."""
+    from isoexec.integrations.full_distribution import (
+        decode_packed_full_logprobs as decode,
+    )
+
+    return decode(payload)
 
 
 def _to_host_array(routed_experts: Any) -> Any:

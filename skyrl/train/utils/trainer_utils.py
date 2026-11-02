@@ -721,6 +721,7 @@ def validate_generator_output(
             "loss_masks",
             "rewards",
             "rollout_logprobs",
+            "rollout_full_logprobs",
             "stop_reasons",
             "trajectory_ids",
             "rollout_expert_indices",
@@ -753,6 +754,13 @@ def validate_generator_output(
             assert len(response_ids) == len(generator_output["rollout_logprobs"][i]), (
                 f"Response ids and rollout logprobs must have the same length, "
                 f"for sample {i} got {len(response_ids)} and {len(generator_output['rollout_logprobs'][i])}"
+            )
+        full_rows = generator_output.get("rollout_full_logprobs")
+        if full_rows is not None:
+            assert full_rows[i].dtype == np.float32 and full_rows[i].ndim == 2
+            assert len(response_ids) == full_rows[i].shape[0], (
+                "Response ids and rollout full logprobs must have the same length, "
+                f"for sample {i} got {len(response_ids)} and {full_rows[i].shape[0]}"
             )
 
     # loss masks should be non-zero for at least one element for trainer

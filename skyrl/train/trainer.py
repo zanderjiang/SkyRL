@@ -117,6 +117,10 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        if cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.config import resolve
+
+            resolve(cfg)
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -716,6 +720,8 @@ class RayPPOTrainer:
                 cfg.trainer.placement.policy_num_nodes,
                 cfg.trainer.placement.policy_num_gpus_per_node,
                 PolicyWorker,
+                enable_isoexec=cfg.enable_isoexec,
+                isoexec_model=cfg.isoexec_model,
                 pg=pg,
                 num_gpus_per_actor=0.2 if pg else 1,
                 colocate_all=True,
@@ -731,6 +737,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.ref_num_nodes,
                     cfg.trainer.placement.ref_num_gpus_per_node,
                     RefWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.2 if pg else 1,
                     colocate_all=True,
@@ -748,6 +756,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.critic_num_nodes,
                     cfg.trainer.placement.critic_num_gpus_per_node,
                     CriticWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.2,
                     colocate_all=True,
@@ -779,6 +789,8 @@ class RayPPOTrainer:
                 cfg.trainer.placement.policy_num_nodes,
                 cfg.trainer.placement.policy_num_gpus_per_node,
                 PolicyWorker,
+                enable_isoexec=cfg.enable_isoexec,
+                isoexec_model=cfg.isoexec_model,
                 pg=pg,
                 num_gpus_per_actor=0.75 if pg else 1,
                 colocate_all=False,
@@ -790,6 +802,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.ref_num_nodes,
                     cfg.trainer.placement.ref_num_gpus_per_node,
                     RefWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.25 if pg else 1,
                     colocate_all=False,
@@ -810,6 +824,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.critic_num_nodes,
                     cfg.trainer.placement.critic_num_gpus_per_node,
                     CriticWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     num_gpus_per_actor=1,
                     colocate_all=False,
                     sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
@@ -992,7 +1008,13 @@ class RayPPOTrainer:
                 "image_grid_thw": image_grid_thw,
             },
         )
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import attach_rollout_rows
+
+            attach_rollout_rows(training_input, generator_output, response_ids, response_masks_tensor.shape[1])
         training_input.metadata = {"uids": uids}
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            training_input.metadata["global_step"] = int(self.global_step)
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1366,6 +1388,10 @@ class RayPPOTrainer:
         is anchor-aware here rather than a static membership in LOSSES_WITHOUT_OLD_LOGPROBS, which is
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
+        if self.cfg.enable_isoexec:
+            return False
+        if getattr(self.cfg.trainer, "rollout_logprob_comparison", "action") == "full":
+            return False
         algorithm = self.cfg.trainer.algorithm
         if algorithm.policy_loss_type == PolicyLossType.CISPO:
             # CISPO reads old logprobs only with the default "old" anchor; "rollout" optimizes against
@@ -1437,6 +1463,12 @@ class RayPPOTrainer:
 
         # Policy forward. Skipped for losses that optimize against rollout logprobs (see
         # `_skip_policy_forward`), where the resulting logprobs are never read.
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import (
+                attach_prescore_rows,
+            )
+
+            attach_prescore_rows(training_input, data_fwd_pass)
         if self._skip_policy_forward(training_input):
             action_log_probs = None
         else:
@@ -1445,6 +1477,20 @@ class RayPPOTrainer:
                 data_fwd_pass,
                 key="logprobs",
                 mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
+            )
+
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.audit import require_comparison
+
+            require_comparison(training_input, action_log_probs)
+
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import (
+                release_prescore_rows,
+            )
+
+            self.all_metrics["policy/full_logprobs_verified_rows"] = release_prescore_rows(
+                training_input, data_fwd_pass
             )
 
         # Empty cache after all forward passes
@@ -1467,6 +1513,11 @@ class RayPPOTrainer:
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
                 - action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
+
+            if self.cfg.enable_isoexec:
+                from isoexec.integrations.skyrl.audit import check_training_batch
+
+                check_training_batch(training_input, action_log_probs, logprobs_diff)
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
             # response dropped by overlong filtering) leaves logprobs_diff empty, and .max()/.min()

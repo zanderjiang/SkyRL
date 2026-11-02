@@ -221,6 +221,7 @@ class MegatronStrategy(DistributedStrategy):
         seed: int = 42,
         is_lora: bool = False,
         node_local_rank: int = 0,
+        enable_isoexec: bool = False,
     ) -> None:
         super().__init__()
         self.megatron_config = megatron_config
@@ -229,6 +230,7 @@ class MegatronStrategy(DistributedStrategy):
         self.hf_config = None  # Set by the megatron worker once configs are initialized.
         self.is_lora = is_lora
         self.node_local_rank = node_local_rank
+        self.enable_isoexec = enable_isoexec
 
         # NOTE: Set Megatron dist checkpoint async backend to persistent to avoid `os.fork()`-ing
         # short-lived background workers, which does not work well with Ray.
@@ -254,6 +256,12 @@ class MegatronStrategy(DistributedStrategy):
         if local_rank != -1:
             torch.cuda.set_device(local_rank)
 
+        nccl_config = None
+        if self.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import channel_config
+
+            # Resolve per-communicator settings before Megatron creates any groups.
+            nccl_config = channel_config(self.megatron_config)
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=self.megatron_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=self.megatron_config.pipeline_model_parallel_size,
@@ -261,7 +269,7 @@ class MegatronStrategy(DistributedStrategy):
             expert_tensor_parallel_size=self.megatron_config.expert_tensor_parallel_size,
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
-            nccl_communicator_config_path=None,
+            nccl_communicator_config_path=nccl_config,
         )
         self.set_seed(self.seed)
         self.world_size = dist.get_world_size()

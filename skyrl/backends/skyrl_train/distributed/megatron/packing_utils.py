@@ -7,6 +7,15 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
 )
 
 
+def should_pack_root_inputs(*, is_pipeline_first_stage: bool, is_vlm: bool, requires_packed_root_inputs: bool) -> bool:
+    """Pack token roots on ranks that consume them.
+
+    ``is_vlm`` denotes a vision-language model. Other native stage models may
+    declare the same need through their carrier's generic capability.
+    """
+    return is_pipeline_first_stage or is_vlm or requires_packed_root_inputs
+
+
 def _fp8_token_align(tp_size: int, cp_size: int, fp8_recipe: Any) -> int:
     # MXFP8 quantizes sequence-parallel all-gather inputs in 1x32 tiles, so
     # every rank's local shard must hold a multiple of 32 tokens: 32*tp*cp

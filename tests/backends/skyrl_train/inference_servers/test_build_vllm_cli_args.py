@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.utils import (
+    _apply_full_logprob_engine_defaults,
     _apply_serialized_fp8_weight_sync_defaults,
     build_frozen_vllm_cli_args,
     build_vllm_cli_args,
@@ -85,6 +86,20 @@ def test_serialized_fp8_requires_model_path():
 
     with pytest.raises(ValueError, match="model path is required"):
         _apply_serialized_fp8_weight_sync_defaults(cfg.generator.inference_engine, {})
+
+
+def test_full_logprobs_require_raw_complete_rows():
+    engine_kwargs = {}
+
+    _apply_full_logprob_engine_defaults(engine_kwargs)
+
+    assert engine_kwargs == {"max_logprobs": -1, "logprobs_mode": "raw_logprobs"}
+
+
+@pytest.mark.parametrize("engine_kwargs", [{"max_logprobs": 20}, {"logprobs_mode": "processed_logprobs"}])
+def test_full_logprobs_reject_conflicting_engine_settings(engine_kwargs):
+    with pytest.raises(ValueError, match="full logprobs"):
+        _apply_full_logprob_engine_defaults(engine_kwargs)
 
 
 def test_serialized_fp8_fails_when_model_config_cannot_be_inspected(monkeypatch):

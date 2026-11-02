@@ -175,7 +175,9 @@ class TensorBatch(dict, Generic[DictType]):
     metadata: Optional[Dict[str, Any]] = None
 
     # These fields may be backed by read-only shared memory after deserialization.
-    ZERO_COPY_KEYS: frozenset[str] = frozenset({"rollout_expert_indices", SAMPLE_SUPPORT_FIELD})
+    ZERO_COPY_KEYS: frozenset[str] = frozenset(
+        {"rollout_expert_indices", "rollout_full_logprobs", SAMPLE_SUPPORT_FIELD}
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -560,6 +562,7 @@ class TrainingInput(TypedDict, total=False):
     kl: Float[torch.Tensor, "batch_size response_len"]  # per-token KL, current vs reference policy
     rewards: Optional[Float[torch.Tensor, "batch_size response_len"]]  # env reward, typically only on the last token
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size response_len"]]  # sampling policy; off-policy corr.
+    rollout_full_logprobs: Optional[Float[torch.Tensor, "batch_size response_len vocab_size"]]
     # MoE router replay, packed to real tokens: values [sum(seq_len_i), layer_num, topk] + cu_seqlens
     rollout_expert_indices: Optional[PackedTensor]
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
