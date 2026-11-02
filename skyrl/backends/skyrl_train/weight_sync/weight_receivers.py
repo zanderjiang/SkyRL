@@ -253,11 +253,32 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
     base class they mix into, and every step here is the same for both.
     """
 
+    def _skyrl_native_update_model(self) -> Any:
+        """Models with paired update hooks consume registered names in place."""
+        model = self.model
+        if callable(getattr(model, "start_weight_update", None)) and callable(
+            getattr(model, "finish_weight_update", None)
+        ):
+            return model
+        return None
+
+    def _skyrl_close_native_imports(self) -> None:
+        # IPC's usual finish closes imported packed buffers after layerwise
+        # reload. Native model hooks replace reload, but retain that cleanup.
+        importer = getattr(self, "_packed_importer", None)
+        if importer is not None:
+            importer.close()
+
     def start_weight_update(self) -> None:
         if self.skyrl_lora_armed():
             # No layerwise reload: an adapter update never writes to the base
             # model's parameters, so there is nothing to reload.
             self.skyrl_begin_lora_update()
+            return
+        native = self._skyrl_native_update_model()
+        if native is not None:
+            with torch.device(self.device):
+                native.start_weight_update()
             return
         skyrl_before_weight_update()
         with torch.device(self.device):
@@ -267,6 +288,14 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
         if self.skyrl_lora_armed():
             with torch.device(self.device), self.skyrl_lora_staging():
                 super().receive_weights(update_info)
+            return
+        if self._skyrl_native_update_model() is not None:
+            try:
+                with torch.device(self.device):
+                    super().receive_weights(update_info)
+            except BaseException:
+                self._skyrl_close_native_imports()
+                raise
             return
         with torch.device(self.device), self.skyrl_checkpoint_load():
             super().receive_weights(update_info)
@@ -288,6 +317,15 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
                 self.skyrl_finish_lora_update()
             finally:
                 self.skyrl_release_receive_buffers()
+            return
+        native = self._skyrl_native_update_model()
+        if native is not None:
+            try:
+                with torch.device(self.device):
+                    native.finish_weight_update()
+            finally:
+                self._skyrl_close_native_imports()
+            empty_cuda_cache_rocm()
             return
         from skyrl.backends.skyrl_train.patches.vllm.patch_moe_kernel_constants import (
             restore_moe_kernel_constants,
