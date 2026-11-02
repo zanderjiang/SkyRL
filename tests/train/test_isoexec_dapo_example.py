@@ -34,8 +34,10 @@ def test_smoke_overrides_reach_dry_run(monkeypatch, capsys):
         "trainer.policy.optimizer_config.num_warmup_steps=0",
         "trainer.rollout_logprob_comparison=action",
         "generator.inference_engine.logprob_output=action",
-        "generator.sampling_params.max_generate_length=256",
-        "trainer.algorithm.overlong_buffer_len=64",
+        "generator.sampling_params.max_generate_length=4096",
+        "trainer.algorithm.overlong_buffer_len=1024",
+        "generator.eval_sampling_params.max_generate_length=4096",
+        "trainer.max_tokens_per_microbatch=-1",
     ]
     monkeypatch.setattr(sys, "argv", ["run_dapo", "--data-dir", "/data", "--run-dir", "/run", "--dry-run", *overrides])
     main()

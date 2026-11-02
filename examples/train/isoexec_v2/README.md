@@ -112,8 +112,10 @@ verification follows IsoExec's default (off); opt in with
 This uses the current upstream GDN provider (CPR), not the older recurrent-only
 branch. This example has not yet been qualified end to end on eight GPUs.
 
-For a two-step startup smoke test, override the 40-step production warmup as well
-as the training limit. Short responses also need a shorter DAPO overlong buffer:
+For a two-step training smoke test, override the 40-step production warmup as well
+as the training limit. Allow 4,096 response tokens so math solutions have room to
+finish, and use one sequence per microbatch to limit activation memory without
+activation checkpointing:
 
 ```bash
 uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo \
@@ -121,9 +123,20 @@ uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo \
   --run-dir /mnt/local_storage/runs/isoexec-qwen35-smoke \
   trainer.max_training_steps=2 trainer.policy.optimizer_config.num_warmup_steps=0 \
   trainer.rollout_logprob_comparison=action generator.inference_engine.logprob_output=action \
-  generator.sampling_params.max_generate_length=256 trainer.algorithm.overlong_buffer_len=64
+  generator.sampling_params.max_generate_length=4096 \
+  generator.eval_sampling_params.max_generate_length=4096 trainer.algorithm.overlong_buffer_len=1024 \
+  trainer.max_tokens_per_microbatch=-1
 ```
 
 This keeps the 2,048-sequence rollout batch and tests sampled-token comparison;
 it does not qualify the full-vocabulary comparison path. The production recipe
-retains its 40-step warmup.
+retains its 40-step warmup. The 2,048-token prompt limit plus 4,096 response
+tokens fits the existing 10,240-token engine context. With token packing disabled,
+the existing forward and training microbatch sizes of one sequence apply.
+
+A 256-token cap produced only truncated, loss-masked responses across a complete
+2,048-sequence batch. Native weight sync, generation, and trainer forward scoring
+completed, but the comparison audit correctly refused a batch with no trainable
+response tokens. Keep overlong filtering and this audit enabled. A longer cap
+increases the chance of completed answers; it does not guarantee them. The
+4,096-token smoke run has not yet completed end-to-end qualification.
