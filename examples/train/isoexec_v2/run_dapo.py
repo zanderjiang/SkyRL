@@ -58,6 +58,24 @@ def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None)
     return values + [f"{key}={json.dumps(value)}" for key, value in settings.items()]
 
 
+def _validate_schedule(overrides: list[str]) -> None:
+    schedule = {}
+    for item in overrides:
+        key, separator, value = item.partition("=")
+        if separator and key in ("trainer.max_training_steps", "trainer.policy.optimizer_config.num_warmup_steps"):
+            try:
+                schedule[key] = json.loads(value)
+            except ValueError:
+                return  # The native config parser handles other CLI representations.
+    steps = schedule.get("trainer.max_training_steps")
+    warmup = schedule.get("trainer.policy.optimizer_config.num_warmup_steps")
+    if type(steps) is int and type(warmup) is int and steps <= warmup:
+        raise ValueError(
+            "trainer.max_training_steps must exceed trainer.policy.optimizer_config.num_warmup_steps; "
+            "set num_warmup_steps=0 for a short smoke test"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True, type=Path)
@@ -66,7 +84,12 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args, extra = parser.parse_known_args()
     command = [sys.executable, "-m", "examples.train.algorithms.dapo.main_dapo"]
-    command += dapo_overrides(args.data_dir, args.run_dir, args.checkpoint) + extra
+    overrides = dapo_overrides(args.data_dir, args.run_dir, args.checkpoint) + extra
+    try:
+        _validate_schedule(overrides)
+    except ValueError as exc:
+        parser.error(str(exc))
+    command += overrides
     os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
     os.environ.setdefault("SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S", "3600")
     if args.dry_run:

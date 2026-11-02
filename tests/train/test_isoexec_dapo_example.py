@@ -21,3 +21,39 @@ def test_dapo_recipe_has_2048_rollouts_and_no_checkpointing():
     assert values["trainer.policy.megatron_config.expert_model_parallel_size"] == 8
     assert values["generator.inference_engine.tensor_parallel_size"] == 8
     assert values["trainer.policy.megatron_config.transformer_config_kwargs"] == {"sequence_parallel": True}
+
+
+def test_smoke_overrides_reach_dry_run(monkeypatch, capsys):
+    import shlex
+    import sys
+
+    from examples.train.isoexec_v2.run_dapo import main
+
+    overrides = [
+        "trainer.max_training_steps=2",
+        "trainer.policy.optimizer_config.num_warmup_steps=0",
+        "trainer.rollout_logprob_comparison=action",
+        "generator.inference_engine.logprob_output=action",
+        "generator.sampling_params.max_generate_length=256",
+        "trainer.algorithm.overlong_buffer_len=64",
+    ]
+    monkeypatch.setattr(sys, "argv", ["run_dapo", "--data-dir", "/data", "--run-dir", "/run", "--dry-run", *overrides])
+    main()
+    command = shlex.split(capsys.readouterr().out)
+    assert command[-len(overrides) :] == overrides
+
+
+def test_short_run_rejects_production_warmup_before_launch(monkeypatch, capsys):
+    import sys
+
+    import pytest
+
+    from examples.train.isoexec_v2.run_dapo import main
+
+    monkeypatch.setattr(
+        sys, "argv", ["run_dapo", "--data-dir", "/data", "--run-dir", "/run", "trainer.max_training_steps=2"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "num_warmup_steps=0" in capsys.readouterr().err

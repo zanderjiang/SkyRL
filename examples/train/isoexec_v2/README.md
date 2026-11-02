@@ -111,3 +111,19 @@ verification follows IsoExec's default (off); opt in with
 
 This uses the current upstream GDN provider (CPR), not the older recurrent-only
 branch. This example has not yet been qualified end to end on eight GPUs.
+
+For a two-step startup smoke test, override the 40-step production warmup as well
+as the training limit. Short responses also need a shorter DAPO overlong buffer:
+
+```bash
+uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo \
+  --data-dir /mnt/local_storage/data/dapo \
+  --run-dir /mnt/local_storage/runs/isoexec-qwen35-smoke \
+  trainer.max_training_steps=2 trainer.policy.optimizer_config.num_warmup_steps=0 \
+  trainer.rollout_logprob_comparison=action generator.inference_engine.logprob_output=action \
+  generator.sampling_params.max_generate_length=256 trainer.algorithm.overlong_buffer_len=64
+```
+
+This keeps the 2,048-sequence rollout batch and tests sampled-token comparison;
+it does not qualify the full-vocabulary comparison path. The production recipe
+retains its 40-step warmup.
