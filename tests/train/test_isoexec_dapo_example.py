@@ -59,3 +59,10 @@ def test_short_run_rejects_production_warmup_before_launch(monkeypatch, capsys):
         main()
     assert exc.value.code == 2
     assert "num_warmup_steps=0" in capsys.readouterr().err
+
+
+def test_dapo_recipe_inherits_fp32_gradient_accumulation():
+    from examples.train.algorithms.dapo.main_dapo import DAPOConfig
+
+    cfg = DAPOConfig.from_cli_overrides(dapo_overrides(Path("/data"), Path("/run")))
+    assert cfg.trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32 is True

@@ -98,7 +98,6 @@ def training_overrides(
             "aux_loss" if model == "qwen1_5_moe_a2_7b" else "none"
         ),
         "trainer.policy.megatron_config.moe_aux_loss_coeff": 0.001 if model == "qwen1_5_moe_a2_7b" else 0.0,
-        "trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32": False,
         "trainer.epochs": 1,
         "trainer.max_training_steps": steps,
         "trainer.update_epochs_per_batch": 1,
