@@ -345,6 +345,7 @@ def build_new_inference_client_impl(
             the internal-servers branch; ignored on external branches.
         start_port: Base of the first launched server's port window; see
             :func:`create_inference_servers`.
+        make_engine_env: Optional policy-specific actor environment, resolved from the CLI args.
         **client_kwargs: Role-specific :class:`RemoteInferenceClient` fields.
 
     Returns:

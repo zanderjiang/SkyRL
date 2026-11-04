@@ -111,7 +111,7 @@ def test_build_new_inference_client_impl_launches_with_the_role_inputs(monkeypat
     )
     calls = []
 
-    def fake_create(ie_cfg_arg, cli_args, log_path, placement_group, start_port):
+    def fake_create(ie_cfg_arg, cli_args, log_path, placement_group, start_port, extra_env_vars=None):
         calls.append((ie_cfg_arg, cli_args, log_path, placement_group, start_port))
         return canned
 
