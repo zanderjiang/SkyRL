@@ -165,9 +165,10 @@ trainer.gradient_checkpointing=true \
 
 A final partial group checkpoints the remaining layers on that pipeline stage.
 The eight-GPU qualification used span `1`; larger spans have CPU equivalence
-coverage but need workload-specific memory and performance checks. Explicit
-`block` or `selective` modes are rejected. When checkpointing is enabled, the
-native runtime rejects boolean layer spans; use an integer such as `1`.
+coverage but need workload-specific memory and performance checks. SkyRL
+selects `full`/`uniform` when its checkpointing flag is enabled. Direct native
+runtime calls reject `block` or `selective` modes and boolean layer spans; use
+an integer span such as `1`.
 
 Recomputation uses Megatron's RNG-aware checkpoint primitive. Standard SkyRL
 setup seeds its CUDA RNG tracker; direct runtime callers must initialize that
@@ -202,9 +203,7 @@ retains its 40-step warmup. The 2,048-token prompt limit plus 4,096 response
 tokens fits the existing 10,240-token engine context. With token packing disabled,
 the existing forward and training microbatch sizes of one sequence apply.
 
-A 256-token cap produced only truncated, loss-masked responses across a complete
-2,048-sequence batch. Native weight sync, generation, and trainer forward scoring
-completed, but the comparison audit correctly refused a batch with no trainable
-response tokens. Keep overlong filtering and this audit enabled. A longer cap
-increases the chance of completed answers; it does not guarantee them. The
-4,096-token smoke run has not yet completed end-to-end qualification.
+Keep overlong filtering and the comparison audit enabled, and allow enough
+response tokens for untruncated, trainable answers. A longer cap increases the
+chance of completed answers; it does not guarantee them. The 4,096-token smoke
+run has not completed end-to-end qualification.
