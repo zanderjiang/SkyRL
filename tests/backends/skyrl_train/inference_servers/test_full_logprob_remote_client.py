@@ -21,9 +21,7 @@ async def test_requests_and_decodes_full_logprobs(monkeypatch, requested_logprob
     client = RemoteGenerateClient(proxy_url="http://unused")
     captured = {}
     values = np.array([[-3.0, -0.25, -2.0]], dtype=np.float32)
-    rows = [
-        {token_id: _Entry(float(value)) for token_id, value in enumerate(values[0])}
-    ]
+    rows = [{token_id: _Entry(float(value)) for token_id, value in enumerate(values[0])}]
 
     async def fake_post(url, json, headers, *, packed_side_channels=False):
         captured.update(url=url, json=json, packed_side_channels=packed_side_channels)
@@ -33,9 +31,7 @@ async def test_requests_and_decodes_full_logprobs(monkeypatch, requested_logprob
                     "token_ids": [1],
                     "finish_reason": "stop",
                     "logprobs": {"content": [{"logprob": -0.25}]},
-                    PackedField.FULL_LOGPROBS.value: pack_full_logprobs(
-                        [1], rows, vocab_size=3
-                    ),
+                    PackedField.FULL_LOGPROBS.value: pack_full_logprobs([1], rows, vocab_size=3),
                 }
             ]
         }

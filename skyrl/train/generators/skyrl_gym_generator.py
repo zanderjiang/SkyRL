@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
+import numpy as np
 import torch
 from loguru import logger
 from tqdm.asyncio import tqdm
