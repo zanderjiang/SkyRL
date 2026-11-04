@@ -33,8 +33,8 @@ uv run --isolated --no-project "$ISOEXEC_ENV/envs/core/bin/python" \
 The runtime requires IsoExec's native OP dependencies, including FlashAttention 3
 and CUTLASS DSL 4.5.2. The explicit CUTLASS install above is required because the
 current bootstrap defaults to 4.7.1, which is not admitted for these models'
-RMSNorm binding. This example uses the current project vLLM 0.30.0 and
-Transformers 5.16.1. Do not install the old vLLM 0.28.0 qualification SDK.
+RMSNorm binding. The generic GSM8K setup uses the project SDK. For the qualified 35B production
+stack, use the dedicated manifest below instead of this generic bootstrap.
 
 ## Shared IsoExec settings
 
@@ -90,27 +90,149 @@ current IsoExec V2 integration. Console logging is the default; select W&B with
 
 ## Qwen3.5-35B-A3B DAPO
 
-Requires the companion IsoExec change `c99f000` (or a successor containing
-`isoexec.models.v2.qwen3_5_moe`) and eight H100 GPUs. The 35B Hub ID tracks its
-default revision; use a local `--checkpoint` snapshot for reproducible runs.
-Prepare cleaned DAPO/AIME parquet files using the DAPO data-preparation example,
-and authenticate W&B through the environment before launching:
+The production recipe uses eight H100 80GB GPUs, trainer TP=4/EP=8 with
+sequence parallelism, and a colocated TP=8 inference engine. The built-in
+`Qwen/Qwen3.5-35B-A3B-Base` checkpoint is pinned to
+`0f0813072d2358973511097385626f21fcb6d422`. A supplied `--checkpoint` is used
+as-is; local directories must contain that snapshot for the same starting weights.
+
+Use the companion IsoExec production environment manifest, which records the
+qualified integration revision and SDK rather than following SkyRL main:
 
 ```bash
-uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo \
+# In the companion IsoExec checkout containing environments/production-35b.toml:
+make setup-dev ISOEXEC_ROOT=/mnt/local_storage/isoexec-production \
+  SETUP_FLAGS='--manifest environments/production-35b.toml'
+export ISOEXEC_ENV=/mnt/local_storage/isoexec-production
+source "$ISOEXEC_ENV/env.sh"
+```
+
+See IsoExec's `environments/production-35b.md` for CUDA, memory and dependency
+requirements. The environment installer has CPU validation; a fresh installation
+has not been qualified by a new eight-GPU training run. Keep the pinned source and
+SDK together rather than substituting current upstream dependencies.
+
+Prepare the two cleaned parquet files described in
+[production-inputs.json](production-inputs.json), authenticate W&B through your
+environment, then run from the prepared SkyRL integration checkout:
+
+```bash
+uv run --isolated --no-project "$ISOEXEC_ENV/envs/core/bin/python" \
+  -m examples.train.isoexec_v2.run_dapo \
   --data-dir /mnt/local_storage/data/dapo \
   --run-dir /mnt/local_storage/runs/isoexec-qwen35-dapo
 ```
 
-Use `--dry-run` to inspect the command or `--checkpoint` for a local checkpoint.
-The rollout batch is 128 prompts × 16 samples = 2,048 sequences. Trainer TP=4,
-EP=8 and sequence parallelism share eight GPUs with a TP=8 inference engine.
-Activation checkpointing and checkpoint export are disabled. Native transfer
-verification follows IsoExec's default (off); opt in with
-`ISOEXEC_VERIFY_NATIVE_TRANSFERS=1` when investigating synchronization.
+Set `ISOEXEC_ENV` to the environment root used above. Use `--dry-run` to inspect
+the command; trailing `key=value` arguments override the defaults. The recipe
+selects these production settings:
 
-This uses the current upstream GDN provider (CPR), not the older recurrent-only
-branch. This example has not yet been qualified end to end on eight GPUs.
+| Setting | Value |
+|---|---|
+| Schedule | 50 steps, 40 warmup steps, learning rate `1e-6`, weight decay `0.1` |
+| Rollouts | 128 prompts × 16 samples = 2,048 sequences |
+| Tokens | prompt 2,048; response 8,192; packed microbatch budget 20,480 |
+| Updates | four optimizer minibatches per rollout; full decoder-layer checkpointing |
+| Gradients and optimizer | FP32 reduction; CPU offload, pinned parameters/gradients, transfer overlap |
+| Scores | exact sampled-action comparison, `logprobs=0`, token-level TIS |
+| Inference | multiprocessing, 512 maximum sequences, decode CUDA Graphs |
+| Evaluation | interval 1,000; 32 samples, top-p `0.7`; none scheduled within 50 steps |
+| Persistence | fresh start; training-state save/resume and HF export disabled |
+
+The CISPO bounds (`0`, `5`) are retained from the recorded configuration; the
+selected policy loss is `dual_clip`, so those bounds do not select CISPO loss.
+The generic `run.py` retains its separate full-vocabulary comparison recipe.
+Native transfer verification defaults off; enable
+`ISOEXEC_VERIFY_NATIVE_TRANSFERS=1` only when investigating synchronization.
+
+### Input provenance
+
+The input manifest records immutable raw-download URLs, raw and cleaned SHA256
+hashes, and row counts. Hugging Face LFS metadata at those revisions matches the
+raw files used by the run: DAPO has 1,791,700 raw rows and 17,391 cleaned rows;
+AIME-2024 has 960 raw rows and 30 cleaned rows. Place the raw files under their
+manifest filenames and run the existing preprocessor:
+
+```bash
+uv run --isolated --no-project "$ISOEXEC_ENV/envs/core/bin/python" \
+  -m examples.train.algorithms.dapo.data_preprocess_dapo_aime \
+  --data-dir /mnt/local_storage/data/dapo
+```
+
+It deduplicates `(data_source, prompt, ability, reward_model)` and removes prompts
+with multiple reward models. Its Polars `unique` call does not preserve row order
+by default. Regenerated parquet bytes and training order may therefore differ;
+**exact replay requires the archived cleaned files matching the manifest hashes**.
+The repository does not distribute those cleaned artifacts. The generic
+`prepare_dapo_data.sh` uses mutable raw URLs; use the manifest URLs for this run.
+
+### Production qualification
+
+[Run cdz5z7l5](https://wandb.ai/zander-jiang/qwen3.5-35b-dapo/runs/cdz5z7l5)
+completed all 50 training steps and 50 exact prescore checks on 2026-11-04,
+with 51 weight-sync phases including initialization and process exit code zero.
+The detailed per-rank finite-gradient/optimizer audit covers the first two cycles;
+no OOM or fatal errors were reported. This followed an earlier 25-step run that
+was intentionally stopped for performance work.
+
+The recipe defaults reproduce the recorded launch settings; run names and output
+paths are user-specific. The raw model and data pins identify the inputs, but
+backward bitwise determinism remains unqualified: repeated uncheckpointed
+controls also varied. The recorded success does not qualify different token
+budgets, parallel layouts, checkpoint spans, or a newly installed environment.
+
+### MoE inference performance
+
+The DAPO launcher enables `ISOEXEC_MOE_AFTER_FC2_OWNER=1` and
+`ISOEXEC_MOE_AFTER_FC2_GATHER=1`. These restore fused expert gathering and combine
+paths while preserving the routing-weight multiplication after FC2 and its
+rounding order. Other IsoExec entrypoints leave these optimizations opt-in.
+Set either variable to `0` before launching to disable that path.
+
+Matched eight-H100, TP=8 tests with the same native model, prompts, and sampling
+settings measured 1.28× decode throughput and 1.22× mixed-prefill throughput.
+The decode fixture used 512 requests with 512 output tokens each; the mixed
+fixture used 1,024 requests with 64–256 output tokens. Three measured rounds
+followed warmup for each fixture. Generated tokens and sampled-token logprobs
+matched exactly in every round, including after sleep, weight update, wake-up,
+and weight restoration. These measurements cover bounded generation workloads;
+production step time also includes longer rollouts, scoring, and training.
+
+### Activation checkpoint settings
+
+`trainer.gradient_checkpointing=true` enables native `full` / `uniform`
+recomputation. The default span is one complete decoder layer, including its
+norms, attention or GDN, MoE/MLP, and residual paths. Embeddings, the final norm,
+and the LM head remain outside these regions. The 35B DAPO recipe enables this
+flag; the smaller-model `run.py` recipe leaves it disabled.
+
+Set `recompute_num_layers` to a positive integer to group consecutive layers.
+For example, append these overrides to
+`uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo` to checkpoint two layers at a
+time while retaining its sequence-parallel setting:
+
+```bash
+trainer.gradient_checkpointing=true \
+'trainer.policy.megatron_config.transformer_config_kwargs={"sequence_parallel":true,"recompute_num_layers":2}'
+```
+
+A final partial group checkpoints the remaining layers on that pipeline stage.
+The eight-GPU qualification used span `1`; larger spans have CPU equivalence
+coverage but need workload-specific memory and performance checks. SkyRL
+selects `full`/`uniform` when its checkpointing flag is enabled. Direct native
+runtime calls reject `block` or `selective` modes and boolean layer spans; use
+an integer span such as `1`.
+
+Recomputation uses Megatron's RNG-aware checkpoint primitive. Standard SkyRL
+setup seeds its CUDA RNG tracker; direct runtime callers must initialize that
+tracker before training. This preserves RNG replay, without making inherently
+nondeterministic kernels bitwise deterministic.
+
+Explicit MoE auxiliary outputs retain their gradients; native SkyRL auxiliary
+loss currently requires PP=1. The DAPO recipe uses auxiliary coefficient zero.
+Keep the standard SkyRL optimizer, offload/onload, and weight-sync lifecycle:
+checkpoint regions share the original registered parameters. Activation
+checkpointing does not enable training-state save/resume or HF export.
 
 For a two-step training smoke test, override the 40-step production warmup as well
 as the training limit. Allow 4,096 response tokens so math solutions have room to
@@ -125,7 +247,7 @@ uv run --isolated --extra megatron -m examples.train.isoexec_v2.run_dapo \
   trainer.rollout_logprob_comparison=action generator.inference_engine.logprob_output=action \
   generator.sampling_params.max_generate_length=4096 \
   generator.eval_sampling_params.max_generate_length=4096 trainer.algorithm.overlong_buffer_len=1024 \
-  trainer.max_tokens_per_microbatch=-1
+  trainer.max_tokens_per_microbatch=-1 trainer.gradient_checkpointing=false
 ```
 
 This keeps the 2,048-sequence rollout batch and tests sampled-token comparison;
@@ -134,9 +256,7 @@ retains its 40-step warmup. The 2,048-token prompt limit plus 4,096 response
 tokens fits the existing 10,240-token engine context. With token packing disabled,
 the existing forward and training microbatch sizes of one sequence apply.
 
-A 256-token cap produced only truncated, loss-masked responses across a complete
-2,048-sequence batch. Native weight sync, generation, and trainer forward scoring
-completed, but the comparison audit correctly refused a batch with no trainable
-response tokens. Keep overlong filtering and this audit enabled. A longer cap
-increases the chance of completed answers; it does not guarantee them. The
-4,096-token smoke run has not yet completed end-to-end qualification.
+Keep overlong filtering and the comparison audit enabled, and allow enough
+response tokens for untruncated, trainable answers. A longer cap increases the
+chance of completed answers; it does not guarantee them. The 4,096-token smoke
+run has not completed end-to-end qualification.

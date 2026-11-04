@@ -6,7 +6,7 @@ from pathlib import Path
 from examples.train.isoexec_v2.run_dapo import dapo_overrides
 
 
-def test_dapo_recipe_has_2048_rollouts_and_no_checkpointing():
+def test_dapo_recipe_has_2048_rollouts_and_activation_checkpointing():
     values = {
         key: json.loads(value)
         for item in dapo_overrides(Path("/data"), Path("/run"))
@@ -15,7 +15,8 @@ def test_dapo_recipe_has_2048_rollouts_and_no_checkpointing():
     assert values["enable_isoexec"] is True
     assert values["isoexec_model"]["source"]["package"] == "isoexec.models.v2.qwen3_5_moe"
     assert values["trainer.train_batch_size"] * values["generator.n_samples_per_prompt"] == 2048
-    assert values["trainer.gradient_checkpointing"] is False
+    assert values["trainer.gradient_checkpointing"] is True
+    assert values["generator.sampling_params.logprobs"] == 0
     assert values["trainer.ckpt_interval"] == values["trainer.hf_save_interval"] == -1
     assert values["trainer.policy.megatron_config.tensor_model_parallel_size"] == 4
     assert values["trainer.policy.megatron_config.expert_model_parallel_size"] == 8
@@ -38,6 +39,7 @@ def test_smoke_overrides_reach_dry_run(monkeypatch, capsys):
         "trainer.algorithm.overlong_buffer_len=1024",
         "generator.eval_sampling_params.max_generate_length=4096",
         "trainer.max_tokens_per_microbatch=-1",
+        "trainer.gradient_checkpointing=false",
     ]
     monkeypatch.setattr(sys, "argv", ["run_dapo", "--data-dir", "/data", "--run-dir", "/run", "--dry-run", *overrides])
     main()
@@ -61,8 +63,21 @@ def test_short_run_rejects_production_warmup_before_launch(monkeypatch, capsys):
     assert "num_warmup_steps=0" in capsys.readouterr().err
 
 
-def test_dapo_recipe_inherits_fp32_gradient_accumulation():
+def test_dapo_recipe_resolves_production_schedule_and_optimizer():
     from examples.train.algorithms.dapo.main_dapo import DAPOConfig
 
     cfg = DAPOConfig.from_cli_overrides(dapo_overrides(Path("/data"), Path("/run")))
     assert cfg.trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32 is True
+    assert cfg.trainer.max_training_steps == 50
+    assert cfg.trainer.policy.optimizer_config.num_warmup_steps == 40
+    assert cfg.trainer.policy.optimizer_config.weight_decay == 0.1
+    optimizer = cfg.trainer.policy.megatron_config.optimizer_config_kwargs
+    assert optimizer["overlap_cpu_optimizer_d2h_h2d"] is True
+    assert optimizer["pin_cpu_grads"] is True
+    assert optimizer["pin_cpu_params"] is True
+    assert cfg.trainer.algorithm.off_policy_correction.tis_ratio_type == "token"
+    assert cfg.trainer.rollout_logprob_comparison == "action"
+    assert cfg.generator.inference_engine.logprob_output == "action"
+    assert cfg.generator.inference_engine.distributed_executor_backend == "mp"
+    assert cfg.generator.sampling_params.min_tokens == 1
+    assert cfg.isoexec_model["revision"] == "0f0813072d2358973511097385626f21fcb6d422"

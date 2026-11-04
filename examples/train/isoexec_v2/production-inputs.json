@@ -1,0 +1,48 @@
+{
+  "production_run": "https://wandb.ai/zander-jiang/qwen3.5-35b-dapo/runs/cdz5z7l5",
+  "model": {
+    "repo": "Qwen/Qwen3.5-35B-A3B-Base",
+    "revision": "0f0813072d2358973511097385626f21fcb6d422"
+  },
+  "preprocessor": {
+    "path": "examples/train/algorithms/dapo/data_preprocess_dapo_aime.py",
+    "sha256": "249a3bd7813c24bbca6886db69677bfd2486888dccbaa39615bb78d1fe0fc2f7",
+    "ordering": "Polars.unique does not preserve row order by default. Regeneration is not guaranteed to reproduce the recorded cleaned file bytes or training order."
+  },
+  "datasets": [
+    {
+      "repo": "BytedTsinghua-SIA/DAPO-Math-17k",
+      "revision": "65877096c24ffa7abc4e4fa5edb95cf3413a5674",
+      "raw": {
+        "filename": "dapo-math-17k.parquet",
+        "url": "https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet",
+        "sha256": "534375d6bb8630d22ab46a56e11f2ffec1d288d8f7d04099bc82d68948705941",
+        "rows": 1791700,
+        "bytes": 299363855
+      },
+      "cleaned": {
+        "filename": "dapo-math-17k-cleaned.parquet",
+        "sha256": "7f2a862378c88d73a9a9bed577d07a222632bf7a39ca5234467e1db05d753c52",
+        "rows": 17391,
+        "bytes": 3544566
+      }
+    },
+    {
+      "repo": "BytedTsinghua-SIA/AIME-2024",
+      "revision": "aa49075e24ad594b79fdf0bdcefa735c2181be67",
+      "raw": {
+        "filename": "aime-2024.parquet",
+        "url": "https://huggingface.co/datasets/BytedTsinghua-SIA/AIME-2024/resolve/aa49075e24ad594b79fdf0bdcefa735c2181be67/data/aime-2024.parquet",
+        "sha256": "12154e38a716d12db5731f9a022ae69a610c4f7d0e0dcc04e902887a686877e7",
+        "rows": 960,
+        "bytes": 29619
+      },
+      "cleaned": {
+        "filename": "aime-2024-cleaned.parquet",
+        "sha256": "2b68f0e59a2241814582359b75f47d8bed9aa63bbb6eb186f076b278076a1373",
+        "rows": 30,
+        "bytes": 21806
+      }
+    }
+  ]
+}
