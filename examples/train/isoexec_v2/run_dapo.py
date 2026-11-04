@@ -3,15 +3,21 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import shlex
 import sys
+from pathlib import Path
 
 from examples.train.isoexec_v2.run import training_overrides
 
 
 def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None) -> list[str]:
-    values = training_overrides("qwen3_5_35b_a3b", data_dir, run_dir, checkpoint=checkpoint)
+    values = training_overrides(
+        "qwen3_5_35b_a3b",
+        data_dir,
+        run_dir,
+        checkpoint=checkpoint,
+        revision="0f0813072d2358973511097385626f21fcb6d422" if checkpoint is None else None,
+    )
     settings = {
         "data.train_data": [str(data_dir / "dapo-math-17k-cleaned.parquet")],
         "data.val_data": [str(data_dir / "aime-2024-cleaned.parquet")],
@@ -21,7 +27,7 @@ def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None)
         "trainer.policy.megatron_config.expert_model_parallel_size": 8,
         "trainer.policy.megatron_config.expert_tensor_parallel_size": 1,
         "trainer.policy.megatron_config.transformer_config_kwargs": {"sequence_parallel": True},
-        "trainer.gradient_checkpointing": False,
+        "trainer.gradient_checkpointing": True,
         "trainer.algorithm.policy_loss_type": "dual_clip",
         "trainer.algorithm.loss_reduction": "token_mean",
         "trainer.algorithm.eps_clip_low": 0.2,
@@ -29,20 +35,39 @@ def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None)
         "trainer.algorithm.clip_ratio_c": 10.0,
         "trainer.algorithm.overlong_buffer_len": 4096,
         "trainer.algorithm.overlong_buffer_penalty_factor": 1.0,
-        "trainer.algorithm.off_policy_correction.tis_ratio_type": None,
+        "trainer.algorithm.off_policy_correction.tis_ratio_type": "token",
+        "trainer.algorithm.cispo.cispo_eps_clip_high": 5,
+        "trainer.algorithm.cispo.cispo_eps_clip_low": 0,
         "trainer.train_batch_size": 128,
         "trainer.policy_mini_batch_size": 32,
         "generator.n_samples_per_prompt": 16,
         "trainer.epochs": 20,
-        "trainer.max_training_steps": None,
+        "trainer.max_training_steps": 50,
         "trainer.max_prompt_length": 2048,
         "generator.max_input_length": 2048,
         "trainer.max_tokens_per_microbatch": 20480,
         "trainer.policy.optimizer_config.num_warmup_steps": 40,
+        "trainer.policy.optimizer_config.weight_decay": 0.1,
+        "trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32": True,
+        "trainer.policy.megatron_config.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d": True,
+        "trainer.policy.megatron_config.optimizer_config_kwargs.pin_cpu_grads": True,
+        "trainer.policy.megatron_config.optimizer_config_kwargs.pin_cpu_params": True,
+        "trainer.rollout_logprob_comparison": "action",
+        "trainer.eval_interval": 1000,
+        "trainer.log_example_interval": 1,
         "trainer.logger": "wandb",
         "trainer.project_name": "qwen3.5-35b-dapo",
         "trainer.run_name": "isoexec-native-qwen35-35b-dapo-2048",
         "generator.apply_overlong_filtering": True,
+        # Zero still returns the sampled token score, without an unused vocabulary top-1.
+        # Full-distribution and sample-support requests override this at the transport.
+        "generator.sampling_params.logprobs": 0,
+        "generator.sampling_params.min_tokens": 1,
+        "generator.eval_n_samples_per_prompt": 32,
+        "generator.eval_sampling_params.top_p": 0.7,
+        "generator.inference_engine.logprob_output": "action",
+        "generator.inference_engine.distributed_executor_backend": "mp",
+        "generator.inference_engine.max_num_seqs": 512,
         "generator.sampling_params.max_generate_length": 8192,
         "generator.eval_sampling_params.max_generate_length": 8192,
         "generator.inference_engine.tensor_parallel_size": 8,
@@ -92,6 +117,8 @@ def main() -> None:
     command += overrides
     os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
     os.environ.setdefault("SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S", "3600")
+    os.environ.setdefault("ISOEXEC_MOE_AFTER_FC2_OWNER", "1")
+    os.environ.setdefault("ISOEXEC_MOE_AFTER_FC2_GATHER", "1")
     if args.dry_run:
         print(shlex.join(command))
     else:

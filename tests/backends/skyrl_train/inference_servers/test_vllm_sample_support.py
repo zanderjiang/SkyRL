@@ -133,7 +133,8 @@ def test_skyrl_generate_rejects_sample_support_without_a_bounded_support(samplin
     assert engine.sampling_params is None
 
 
-def test_skyrl_generate_returns_packed_sample_support():
+@pytest.mark.parametrize("requested_logprobs", [None, 0, 1])
+def test_skyrl_generate_returns_packed_sample_support(requested_logprobs):
     app = FastAPI()
     engine = FakeEngine()
     VLLMServerActor._add_custom_endpoints(app, engine, SimpleNamespace(enable_lora=False))
@@ -143,7 +144,7 @@ def test_skyrl_generate_returns_packed_sample_support():
             "/skyrl/v1/generate",
             json={
                 "token_ids": [1, 2],
-                "sampling_params": {"temperature": 1.0, "top_k": 2},
+                "sampling_params": {"temperature": 1.0, "top_k": 2, "logprobs": requested_logprobs},
                 "return_sample_support": True,
             },
         )
