@@ -179,16 +179,7 @@ class DistributedTorchRayActor:
     def get_master_addr_port(self):
         return self._master_addr, self._master_port
 
-    # TODO(tgriggs): For numa affinity, pass in the Worker._local_rank for the second arg here. Distinguish 'rank' and 'local_rank' differ here.
     def _set_numa_affinity(self, rank):
-        def local_rank_to_real_gpu_id(local_rank):
-            cuda_visible_devices = [
-                int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",")
-            ]
-            return cuda_visible_devices[local_rank]
-
-        rank = local_rank_to_real_gpu_id(rank)
-
         global _SET_AFFINITY
         if _SET_AFFINITY:
             return
@@ -247,13 +238,12 @@ class DistributedTorchRayActor:
         def gpu_numa_node():
             """NUMA node of the GPU this worker owns, or None if it can't be determined.
 
-            Ray masks CUDA_VISIBLE_DEVICES down to this worker's single GPU, so cuda:0 is
-            that GPU and its PCI affinity is the exact answer -- no rank-to-socket heuristic
-            needed (and none works: with one visible device, GPU-count-based sharding sends
-            every rank but 0 to the last node).
+            Query the current logical CUDA device: Ray may expose either one GPU or all
+            GPUs. CUDA resolves numeric, reordered, and UUID visibility masks when returning
+            the device's PCI properties; do not remap the logical device ordinal manually.
             """
             try:
-                props = torch.cuda.get_device_properties(0)
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
                 bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
             except Exception:
                 return None
