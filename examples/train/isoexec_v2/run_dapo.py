@@ -3,9 +3,9 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import shlex
 import sys
+from pathlib import Path
 
 from examples.train.isoexec_v2.run import training_overrides
 
@@ -21,7 +21,7 @@ def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None)
         "trainer.policy.megatron_config.expert_model_parallel_size": 8,
         "trainer.policy.megatron_config.expert_tensor_parallel_size": 1,
         "trainer.policy.megatron_config.transformer_config_kwargs": {"sequence_parallel": True},
-        "trainer.gradient_checkpointing": False,
+        "trainer.gradient_checkpointing": True,
         "trainer.algorithm.policy_loss_type": "dual_clip",
         "trainer.algorithm.loss_reduction": "token_mean",
         "trainer.algorithm.eps_clip_low": 0.2,
@@ -43,6 +43,9 @@ def dapo_overrides(data_dir: Path, run_dir: Path, checkpoint: str | None = None)
         "trainer.project_name": "qwen3.5-35b-dapo",
         "trainer.run_name": "isoexec-native-qwen35-35b-dapo-2048",
         "generator.apply_overlong_filtering": True,
+        # Zero still returns the sampled token score, without an unused vocabulary top-1.
+        # Full-distribution and sample-support requests override this at the transport.
+        "generator.sampling_params.logprobs": 0,
         "generator.sampling_params.max_generate_length": 8192,
         "generator.eval_sampling_params.max_generate_length": 8192,
         "generator.inference_engine.tensor_parallel_size": 8,
@@ -92,6 +95,8 @@ def main() -> None:
     command += overrides
     os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
     os.environ.setdefault("SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S", "3600")
+    os.environ.setdefault("ISOEXEC_MOE_AFTER_FC2_OWNER", "1")
+    os.environ.setdefault("ISOEXEC_MOE_AFTER_FC2_GATHER", "1")
     if args.dry_run:
         print(shlex.join(command))
     else:
