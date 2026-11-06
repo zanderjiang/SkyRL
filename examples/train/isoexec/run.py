@@ -9,6 +9,11 @@ import sys
 
 
 MODELS = {
+    "qwen3_5_35b_a3b": (
+        "Qwen/Qwen3.5-35B-A3B-Base",
+        "isoexec.models.qwen3_5_moe",
+        None,
+    ),
     "qwen3_5_0_8b": (
         "Qwen/Qwen3.5-0.8B",
         "isoexec.models.qwen3_5",
