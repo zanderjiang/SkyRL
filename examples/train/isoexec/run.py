@@ -1,4 +1,4 @@
-"""Run GSM8K with IsoExec Model V2, Megatron training and vLLM inference."""
+"""Run GSM8K with IsoExec, Megatron training and vLLM inference."""
 
 import argparse
 import json
@@ -11,17 +11,17 @@ import sys
 MODELS = {
     "qwen3_5_0_8b": (
         "Qwen/Qwen3.5-0.8B",
-        "isoexec.models.v2.qwen3_5",
+        "isoexec.models.qwen3_5",
         "2fc06364715b967f1860aea9cf38778875588b17",
     ),
     "qwen3_5_9b": (
         "Qwen/Qwen3.5-9B",
-        "isoexec.models.v2.qwen3_5",
+        "isoexec.models.qwen3_5",
         "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
     ),
     "qwen1_5_moe_a2_7b": (
         "Qwen/Qwen1.5-MoE-A2.7B",
-        "isoexec.models.v2.qwen2_moe",
+        "isoexec.models.qwen2_moe",
         "1a758c50ecb6350748b9ce0a99d2352fd9fc11c9",
     ),
 }
@@ -38,9 +38,9 @@ def training_overrides(
 ) -> list[str]:
     """Keep model geometry in the selected checkpoint's HF config.json."""
     hf_repo, package, default_revision = MODELS[model]
-    # IsoExec Model V2: import the shared architecture; read dimensions from HF config.json.
+    # Import the shared architecture package; read dimensions from HF config.json.
     source: dict[str, object] = {
-        "source": {"api_version": 2, "package": package},
+        "source": {"package": package},
         # IsoExec placement policy for trainer and inference parameters.
         "trainer_placement": {"leaves": 8, "leaf_dtype": "bf16"},
         "inference_placement": {"leaves": 8, "leaf_dtype": "bf16"},
@@ -117,7 +117,7 @@ def training_overrides(
         "trainer.policy.optimizer_config.lr": 1e-6,
         "trainer.policy.optimizer_config.num_warmup_steps": 0,
         "trainer.logger": "console",
-        "trainer.project_name": "isoexec-model-v2",
+        "trainer.project_name": "isoexec",
         "trainer.run_name": model,
         "trainer.log_path": str(run_dir / "logs"),
         "trainer.ckpt_path": str(run_dir / "checkpoints"),
@@ -158,7 +158,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", help="Local/private checkpoint directory or a Hub model ID")
     parser.add_argument("--revision", help="Hub revision; built-in model IDs default to pinned commits")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / "data/gsm8k")
-    parser.add_argument("--run-dir", type=Path, default=Path("outputs/isoexec-v2"))
+    parser.add_argument("--run-dir", type=Path, default=Path("outputs/isoexec"))
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true", help="Print the command without starting Ray or a GPU")
     args, extra = parser.parse_known_args()

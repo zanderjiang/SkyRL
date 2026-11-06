@@ -24,7 +24,7 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S="${SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S:-1200}"
 runner=(uv run --isolated --no-project "$PYTHON_EXECUTABLE")
 # IsoExec selects the shared architecture and reads dimensions from the HF checkpoint.
-source_config='{"source":{"api_version":2,"package":"isoexec.models.v2.qwen3_5"},"revision":"2fc06364715b967f1860aea9cf38778875588b17","trainer_placement":{"leaves":8,"leaf_dtype":"bf16"},"inference_placement":{"leaves":8,"leaf_dtype":"bf16"}}'
+source_config='{"source":{"package":"isoexec.models.qwen3_5"},"revision":"2fc06364715b967f1860aea9cf38778875588b17","trainer_placement":{"leaves":8,"leaf_dtype":"bf16"},"inference_placement":{"leaves":8,"leaf_dtype":"bf16"}}'
 engine_kwargs='{"compilation_config":{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"},"max_model_len":2048,"max_num_seqs":8,"prefill_context_parallel_size":1,"decode_context_parallel_size":1,"quantization":null,"speculative_config":null,"seed":42}'
 
 command=(-m skyrl.train.entrypoints.main_base
@@ -71,7 +71,7 @@ command=(-m skyrl.train.entrypoints.main_base
   trainer.policy.optimizer_config.num_warmup_steps=0
   trainer.logger=console
   trainer.project_name=qwen3.5-35b-dapo
-  "trainer.run_name=isoexec-qwen3.5-0.8b-v2-pp$PP"
+  "trainer.run_name=isoexec-qwen3.5-0.8b-pp$PP"
   "trainer.log_path=$RUN_DIR/logs"
   "trainer.ckpt_path=$RUN_DIR/checkpoints"
   "trainer.export_path=$RUN_DIR/exports"

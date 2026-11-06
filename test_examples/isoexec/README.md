@@ -1,4 +1,4 @@
-# IsoExec Qwen3.5-0.8B V2 training configuration
+# IsoExec Qwen3.5-0.8B training configuration
 
 Activate a prepared Linux/H100 environment with this SkyRL branch and IsoExec
 installed, including its Megatron/vLLM kernel dependencies. Set
@@ -8,19 +8,19 @@ environment without reinstalling CUDA packages.
 From the SkyRL repository root, on four GPUs:
 
 ```bash
-bash test_examples/model_v2/run_isoexec_qwen3.5_0.8b.sh
+bash test_examples/isoexec/run_isoexec_qwen3.5_0.8b.sh
 ```
 
 For PP2 on eight GPUs:
 
 ```bash
-PP=2 bash test_examples/model_v2/run_isoexec_qwen3.5_0.8b.sh
+PP=2 bash test_examples/isoexec/run_isoexec_qwen3.5_0.8b.sh
 ```
 
 The shell contains the complete configuration: trainer TP2/SP/dense DP2,
 two independent inference engines each using TP2 and the same PP, BF16,
-text-only, MTP/speculation off, and LoRA rank 0. The V2 source is
-`isoexec.models.v2.qwen3_5_0_8b`; the official checkpoint revision is pinned.
+text-only, MTP/speculation off, and LoRA rank 0. The model package is
+`isoexec.models.qwen3_5`; the official checkpoint revision is pinned.
 Both full-logprob settings are enabled so policy prescore compares complete FP32
 vocabulary rows before the optimizer update.
 
@@ -40,7 +40,7 @@ Append normal SkyRL overrides, for example `trainer.max_training_steps=10`.
 To print the command without launching training:
 
 ```bash
-DRY_RUN=1 bash test_examples/model_v2/run_isoexec_qwen3.5_0.8b.sh
+DRY_RUN=1 bash test_examples/isoexec/run_isoexec_qwen3.5_0.8b.sh
 ```
 
 This example contains no Modal submission code, frozen source bundle, or

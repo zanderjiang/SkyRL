@@ -20,7 +20,7 @@ def test_root_settings_are_forwarded_to_master_and_peer_actors(monkeypatch, enab
     from skyrl.backends.skyrl_train.workers import worker
 
     cfg = SkyRLTrainConfig.from_cli_overrides([f"enable_isoexec={str(enabled).lower()}"])
-    cfg.isoexec_model = {"source": {"api_version": 2, "package": "isoexec.models.v2.qwen3_5"}} if enabled else None
+    cfg.isoexec_model = {"source": {"package": "isoexec.models.qwen3_5"}} if enabled else None
     received = []
 
     class Actor:

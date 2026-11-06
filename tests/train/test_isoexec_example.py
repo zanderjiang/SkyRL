@@ -1,4 +1,4 @@
-"""The shared example resolves real HF configs through the V2 driver boundary."""
+"""The shared example resolves real HF configs through the IsoExec driver boundary."""
 
 import json
 import runpy
@@ -13,7 +13,7 @@ from safetensors.torch import save_file
 
 from skyrl.train.config import SkyRLTrainConfig
 
-EXAMPLE = Path(__file__).resolve().parents[2] / "examples/train/isoexec_v2/run.py"
+EXAMPLE = Path(__file__).resolve().parents[2] / "examples/train/isoexec/run.py"
 example = runpy.run_path(str(EXAMPLE))
 MODELS, training_overrides = example["MODELS"], example["training_overrides"]
 
@@ -51,7 +51,7 @@ def _qwen35_config() -> dict[str, object]:
 
 
 def test_checkpoint_config_selects_the_shared_architecture(tmp_path):
-    pytest.importorskip("isoexec.model.v2")
+    pytest.importorskip("isoexec.models.qwen3_5.model")
     from isoexec.integrations.skyrl.full_distribution_config import (
         validate_full_distribution_config,
     )
@@ -91,8 +91,8 @@ def test_checkpoint_config_selects_the_shared_architecture(tmp_path):
 
 
 def test_presets_select_architecture_packages_without_bundled_checkpoint_configs():
-    assert MODELS["qwen3_5_0_8b"][1] == MODELS["qwen3_5_9b"][1] == "isoexec.models.v2.qwen3_5"
-    assert MODELS["qwen1_5_moe_a2_7b"][1] == "isoexec.models.v2.qwen2_moe"
+    assert MODELS["qwen3_5_0_8b"][1] == MODELS["qwen3_5_9b"][1] == "isoexec.models.qwen3_5"
+    assert MODELS["qwen1_5_moe_a2_7b"][1] == "isoexec.models.qwen2_moe"
 
 
 def test_dry_run_keeps_paths_and_native_overrides_without_starting_training(tmp_path):
@@ -115,5 +115,5 @@ def test_dry_run_keeps_paths_and_native_overrides_without_starting_training(tmp_
     assert cfg.trainer.max_training_steps == 2
     assert cfg.isoexec_model is not None
     assert cfg.isoexec_model["revision"] == MODELS["qwen3_5_0_8b"][2]
-    assert cfg.isoexec_model["source"]["package"] == "isoexec.models.v2.qwen3_5"
+    assert cfg.isoexec_model["source"]["package"] == "isoexec.models.qwen3_5"
     assert not any("model_factory" in argument for argument in command)
