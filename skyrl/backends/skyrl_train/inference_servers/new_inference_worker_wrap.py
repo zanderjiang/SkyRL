@@ -148,14 +148,6 @@ from skyrl.backends.skyrl_train.patches.vllm.patch_per_block_fp8_param import ( 
 
 apply_per_block_fp8_param_patch()
 
-# R3 on monolithic MoE kernels (FlashInfer TRT-LLM FP8): the routed-experts capture callback is
-# bound once at startup and lost when a weight sync rebuilds the kernel (vllm#59449 / #59455).
-from skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_rebind import (  # noqa: E402
-    apply_routed_experts_rebind_patch,
-)
-
-apply_routed_experts_rebind_patch()
-
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
 
