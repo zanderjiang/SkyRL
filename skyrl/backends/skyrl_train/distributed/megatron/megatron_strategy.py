@@ -232,12 +232,6 @@ class MegatronStrategy(DistributedStrategy):
         if local_rank != -1:
             torch.cuda.set_device(local_rank)
 
-        nccl_config = None
-        if self.enable_isoexec:
-            from isoexec.integrations.skyrl.megatron import channel_config
-
-            # Resolve per-communicator settings before Megatron creates any groups.
-            nccl_config = channel_config(self.megatron_config)
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=self.megatron_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=self.megatron_config.pipeline_model_parallel_size,
@@ -245,7 +239,7 @@ class MegatronStrategy(DistributedStrategy):
             expert_tensor_parallel_size=self.megatron_config.expert_tensor_parallel_size,
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
-            nccl_communicator_config_path=nccl_config,
+            nccl_communicator_config_path=None,
         )
         self.set_seed(self.seed)
         self.world_size = dist.get_world_size()
